@@ -1,0 +1,3 @@
+# Eval-only dependencies. Not part of the client product (see requirements.txt).
+# Install with: pip install -r eval/requirements-eval.txt
+openpyxl>=3.1

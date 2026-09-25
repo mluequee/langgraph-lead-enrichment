@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from dataclasses import dataclass
 import os
+import re
 import requests
 import operator
 import json
@@ -13,6 +14,7 @@ import sqlite3
 import logging as py_logging
 import csv
 import sys
+from urllib.parse import urlparse
 if sys.platform == 'win32':
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -22,9 +24,9 @@ from datetime import datetime
 py_logging.getLogger("anthropic").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain_anthropic").setLevel(py_logging.WARNING)
-load_dotenv()
+load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
-DB_PATH = "leads.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
 
 @dataclass
 class Lead:
@@ -32,6 +34,10 @@ class Lead:
     id: int
     business_name: str
     website: str
+    address: str = ""
+    phone: str = ""
+    city: str = ""
+    state: str = ""
 
 @dataclass
 class LeadCost:
@@ -79,11 +85,22 @@ class LeadDatabase:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        cursor.execute("SELECT id, business_name, website FROM leads")
+        cursor.execute("SELECT id, business_name, website, address, phone, city, state FROM leads")
         rows = cursor.fetchall()
         conn.close()
 
-        return [Lead(id=row['id'], business_name=row['business_name'], website=row['website']) for row in rows]
+        return [
+            Lead(
+                id=row['id'],
+                business_name=row['business_name'],
+                website=row['website'] or "",
+                address=row['address'] or "",
+                phone=row['phone'] or "",
+                city=row['city'] or "",
+                state=row['state'] or "",
+            )
+            for row in rows
+        ]
 
     def write_result(self, lead_id: int, result: dict) -> None:
         """Write extraction results for a lead. FIXED: corrected typos from Phase 6."""
@@ -176,7 +193,14 @@ class VerificationResult(BaseModel):
     verification_reasoning: str
 
 class LeadState(TypedDict):
+    lead_id: int
     business_name: str
+    website: str
+    address: str
+    phone: str
+    city: str
+    state: str
+    fallback_website: str
     queries: list[str]
     search_results: Annotated[list[dict], operator.add]
     combined_source_text: str
@@ -199,15 +223,134 @@ class LeadState(TypedDict):
 
 structured_model = extract_model.with_structured_output(OwnerResult, include_raw=True)
 
+# Phase 8: Identity anchor - location gate + about-page targeting
+
+US_STATES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
+    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
+    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
+    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri",
+    "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
+    "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
+    "VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+# Booksy/thecut/Square/Vagaro/StyleSeat: booking platforms, never the shop's own domain.
+BOOKING_PLATFORM_DOMAINS = ("booksy.com", "thecut.co", "squareup.com", "square.site", "vagaro.com", "styleseat.com")
+
+
+def _phone_digits(phone: str) -> str:
+    """Last 10 digits of a phone number, for comparing across formats."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def _street_fragment(address: str) -> str:
+    """Street number + first word of the street name, e.g. '608 Park' from
+    '608 Park St, Belmont, NC 28012, USA'. Used as a deterministic anchor."""
+    if not address:
+        return ""
+    street = address.split(",")[0].strip()
+    tokens = street.split()
+    if len(tokens) < 2:
+        return ""
+    return f"{tokens[0]} {tokens[1]}"
+
+
+def _is_anchor_result(title: str, description: str, url: str, phone: str, address: str) -> bool:
+    """A result is an anchor when it contains the lead's own phone number or
+    street address - the strongest disambiguators available."""
+    text = f"{title} {description} {url}"
+    phone_digits = _phone_digits(phone)
+    if phone_digits and phone_digits in re.sub(r"\D", "", text):
+        return True
+    fragment = _street_fragment(address)
+    if fragment and fragment.lower() in text.lower():
+        return True
+    return False
+
+
+def _names_other_state(title: str, description: str, lead_state: str) -> bool:
+    """Deterministic location gate, run before any LLM sees a result. Discards
+    a result that confidently names a DIFFERENT state than the lead's own -
+    never on a bare 2-letter code (too many read as ordinary words), only on
+    a full state name or an address-shaped ', XX 12345' citation."""
+    if not lead_state:
+        return False
+    text = f"{title} {description}"
+    lead_state = lead_state.upper()
+
+    for abbr, full in US_STATES.items():
+        if abbr == lead_state:
+            continue
+        if re.search(rf"\b{re.escape(full)}\b", text, re.IGNORECASE):
+            return True
+
+    for m in re.finditer(r",\s*([A-Z]{2})\s+\d{5}", text):
+        if m.group(1) != lead_state:
+            return True
+
+    return False
+
+
+def _names_other_city(title: str, description: str, lead_city: str, lead_state: str) -> bool:
+    """Catches the case _names_other_state can't: a same-named shop in a
+    DIFFERENT city but the SAME state. Address-shaped only (', City, ST'),
+    never a bare city-name word match - city names are too ambiguous
+    (repeat across states, double as first names) to discard on alone."""
+    if not lead_city:
+        return False
+    text = f"{title} {description}"
+    lead_city_norm = lead_city.strip().lower()
+
+    for m in re.finditer(r",\s*([A-Za-z][A-Za-z .'-]*?),\s*([A-Z]{2})\b", text):
+        city, st = m.group(1).strip().lower(), m.group(2)
+        if city and city != lead_city_norm and (st == lead_state.upper() if lead_state else True):
+            return True
+    return False
+
+
+def _is_booking_platform(url: str) -> bool:
+    if not url:
+        return False
+    netloc = urlparse(url).netloc.lower()
+    return any(d in netloc for d in BOOKING_PLATFORM_DOMAINS)
+
+
+def _resolve_fallback_website(search_results: list[dict], phone: str) -> str:
+    """Brave's `locations` block is NOT a lookup of this shop - a 'Charlotte NC'
+    query can return an unrelated shop first. Never take locations[0]; accept
+    an entry only when its phone matches the lead's own phone."""
+    phone_digits = _phone_digits(phone)
+    if not phone_digits:
+        return ""
+    for search_set in search_results:
+        for loc in search_set.get("locations", []):
+            if _phone_digits(loc.get("phone", "")) == phone_digits:
+                return loc.get("url", "")
+    return ""
+
+
 def prep_lead(state: LeadState) -> dict:
     business_name = state.get("business_name", "Unknown")
     logger.info(f"Processing lead: {business_name}")
     # Initialize cost tracking for this lead
     lead_id = state.get("lead_id", 0)
     cost = LeadCost(lead_id=lead_id, business_name=business_name)
-    
+
     return {
         "business_name": business_name,
+        "lead_id": lead_id,
+        "website": state.get("website", ""),
+        "address": state.get("address", ""),
+        "phone": state.get("phone", ""),
+        "city": state.get("city", ""),
+        "state": state.get("state", ""),
+        "fallback_website": "",
         "queries": [],
         "search_results": [],
         "combined_source_text": "",
@@ -229,14 +372,19 @@ def prep_lead(state: LeadState) -> dict:
     }
 
 def build_queries(state: LeadState) -> dict:
-    """Port n8n's 4-query construction."""
+    """Location-anchored query construction. City/state come from the lead's own
+    address, never hardcoded (25 of 107 leads are outside Charlotte)."""
     business_name = state["business_name"]
+    location = " ".join(p for p in (state.get("city", ""), state.get("state", "")) if p)
+    # No exact-phrase quotes: real-world sources (news, directories) refer to a
+    # shop by a shortened/differently-punctuated name, and quoting excludes them.
+    anchor = f"{business_name} {location}".strip() if location else business_name
 
     queries = [
-        f"{business_name} owner",
-        f"{business_name} founded barber",
-        f"{business_name} instagram",
-        f"{business_name} decision maker",
+        f"{anchor} owner",
+        f"{anchor} founded barber",
+        f"{anchor} instagram",
+        f"{anchor} decision maker",
     ]
     logger.debug(f"Built 4 queries for '{business_name}':\n" + "\n".join(f" Q{i+1}: {q}" for i, q in enumerate(queries)))
     return {"queries": queries}
@@ -275,17 +423,30 @@ def _brave_search(state: LeadState, query_index: int) -> dict:
         response.raise_for_status()
         data = response.json()
         results = data.get("web", {}).get("results", [])
-        logger.debug(f"Q{query_index + 1} returned {len(results)} results")
+        # Phase 8: Brave's `locations` block, when present, is a candidate fallback
+        # website for leads with no website on file - NOT a lookup of this shop.
+        # combine_and_score only accepts an entry whose phone matches the lead's.
+        locations = [
+            {
+                "url": loc.get("url", ""),
+                "phone": (loc.get("contact") or {}).get("telephone", ""),
+            }
+            for loc in data.get("locations", {}).get("results", [])
+        ]
+        logger.debug(f"Q{query_index + 1} returned {len(results)} results, {len(locations)} location(s)")
     except requests.exceptions.Timeout:
         logger.warning(f"Q{query_index + 1} timeout: {query}")
         cost.brave_calls += 1  # Count the retry
         results = []
+        locations = []
     except requests.exceptions.HTTPError as e:
         logger.warning(f"Q{query_index + 1} HTTP error ({response.status_code}): {e}")
         results = []
+        locations = []
     except Exception as e:
         logger.warning(f"Q{query_index + 1} failed: {type(e).__name__}: {e}")
         results = []
+        locations = []
 
     return {
         "search_results": [
@@ -293,28 +454,46 @@ def _brave_search(state: LeadState, query_index: int) -> dict:
                 "query": query,
                 "query_index": query_index,
                 "results": results,
+                "locations": locations,
             }
         ],
     }
 
 def combine_and_score(state: LeadState) -> dict:
-    """Score, dedupe, rank and format results from all 4 queries"""
+    """Score, dedupe, rank and format results from all 4 queries.
+    Phase 8: deterministic location gate runs before any LLM sees a result -
+    discards results naming another state, marks phone/address anchor results."""
     business_name = state["business_name"].lower()
+    lead_city = state.get("city", "")
+    lead_state = state.get("state", "")
+    lead_phone = state.get("phone", "")
+    lead_address = state.get("address", "")
+
     all_results_with_scores = []
+    discarded_wrong_location = 0
 
     for search_set in state["search_results"]:
         results = search_set.get("results", [])
 
         for result in results:
             url = result.get("url", "").lower()
-            title = result.get("title", "").lower()
-            description = result.get("description", "").lower()
+            title_raw = result.get("title", "")
+            description_raw = result.get("description", "")
+            title = title_raw.lower()
+            description = description_raw.lower()
 
             # Skip filtered URLs
             if "authwall" in url or "linkedin-signup" in url:
                 continue
 
-            score = _score_result(title, description, url, business_name)
+            if _names_other_state(title_raw, description_raw, lead_state) or \
+               _names_other_city(title_raw, description_raw, lead_city, lead_state):
+                discarded_wrong_location += 1
+                continue
+
+            is_anchor = _is_anchor_result(title_raw, description_raw, url, lead_phone, lead_address)
+
+            score = _score_result(title, description, url, business_name, is_anchor)
 
             all_results_with_scores.append({
                 "url": result.get("url", ""),
@@ -322,6 +501,9 @@ def combine_and_score(state: LeadState) -> dict:
                 "description": result.get("description", ""),
                 "score": score
             })
+
+    if discarded_wrong_location:
+        logger.debug(f"Location gate discarded {discarded_wrong_location} result(s) naming another state")
 
     # Dedupe by URL (keep first occurrence)
     seen_urls = set()
@@ -346,13 +528,20 @@ def combine_and_score(state: LeadState) -> dict:
 
     logger.debug(f"Combined & scored: {len(deduped)} deduped, top 8 ranked, {len(combined_text)} chars")
 
+    fallback_website = _resolve_fallback_website(state["search_results"], lead_phone)
+
     return {
         "combined_source_text": combined_text,
+        "fallback_website": fallback_website,
     }
 
-def _score_result(title: str, description: str, url: str, business_name: str) -> int:
+def _score_result(title: str, description: str, url: str, business_name: str, is_anchor: bool = False) -> int:
     """Score a single search result."""
     score = 0
+
+    # Phase 8: phone/address anchor is the strongest disambiguator - dominates ranking.
+    if is_anchor:
+        score += 100
 
     # Platform signals
     if "instagram" in url:
@@ -546,33 +735,39 @@ def route_after_verification(state: LeadState) -> str:
         return "fetch_about_page"
 
 def fetch_about_page(state: LeadState) -> dict:
-    """Fetch and filter About page for owner names."""
-    combined_text = state["combined_source_text"]
+    """Fetch and filter About page for owner names.
+    Phase 8: only from the lead's OWN domain, never the top search result's -
+    a same-named out-of-state shop ranking first used to make a wrong answer
+    more confident. Skips booking-platform URLs (Booksy, thecut, Square, etc.)."""
     cost = state["cost"]
-    
-    # Extract domain from top result (already ranked)
-    import re
-    urls = re.findall(r'URL: (https?://[^\s]+)', combined_text)
-    
-    if not urls:
-        logger.debug("No URLs found for About-page fetch")
+
+    website = state.get("website", "")
+    fallback = state.get("fallback_website", "")
+
+    domain_source = ""
+    if website and not _is_booking_platform(website):
+        domain_source = website
+    elif fallback and not _is_booking_platform(fallback):
+        domain_source = fallback
+
+    if not domain_source:
+        logger.debug("No usable owned domain for About-page fetch (blank or booking platform)")
         return {"about_page_text": ""}
-    
-    top_url = urls[0]
-    
+
     # Parse domain
     try:
-        from urllib.parse import urlparse
-        parsed = urlparse(top_url)
+        parsed = urlparse(domain_source)
+        if not parsed.scheme:
+            parsed = urlparse(f"https://{domain_source}")
         domain = f"{parsed.scheme}://{parsed.netloc}"
-    except:
-        logger.debug(f"Failed to parse domain from {top_url}")
+    except Exception:
+        logger.debug(f"Failed to parse domain from {domain_source}")
         return {"about_page_text": ""}
-    
+
     # Try about-page variants
     about_paths = ["/about", "/about-us", "/team", "/about-page"]
     about_text = ""
-    
+
     for path in about_paths:
         try:
             about_url = domain + path
@@ -581,7 +776,7 @@ def fetch_about_page(state: LeadState) -> dict:
                 about_text = response.text
                 logger.debug(f"Fetched {about_url}")
                 break
-        except:
+        except Exception:
             pass
     
     # Filter: only sentences with founder/owner/CEO + capitalized name
@@ -811,7 +1006,7 @@ class AccuracyComparison:
 def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte_Barbershops__7_.csv"):
     """Process multiple leads from database and compare to n8n baseline."""
     db = LeadDatabase()
-    leads = db.get_all_leads()
+    leads = db.get_all_leads()[:5]
 
     logger.info(f"\n{'='*80}")
     logger.info(f"PHASE 7: BATCH PROCESSING + COST TRACKING + ACCURACY COMPARISON")
@@ -838,7 +1033,15 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
         logger.info(f"\n[{i}/{len(leads)}] {lead.business_name}")
 
         try:
-            result = app.invoke({"business_name": lead.business_name, "lead_id": lead.id})
+            result = app.invoke({
+                "business_name": lead.business_name,
+                "lead_id": lead.id,
+                "website": lead.website,
+                "address": lead.address,
+                "phone": lead.phone,
+                "city": lead.city,
+                "state": lead.state,
+            })
 
             db.write_result(lead.id, result)
 
