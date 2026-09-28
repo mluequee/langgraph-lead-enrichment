@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Internal working notes - gitignored until the precision fix lands and the README is corrected (see Session-Log 2026-09-24)
+CLAUDE.md
+
 # Database files
 leads.db
 *.db
