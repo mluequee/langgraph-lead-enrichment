@@ -182,6 +182,8 @@ class OwnerResult(BaseModel):
     facebook: str
     confidence: Literal["high", "medium", "low"]
     why_this_person: str
+    evidence_snippet: str
+    evidence_url: str
 
 class VerificationResult(BaseModel):
     """Sonnet's verification of Haiku's extraction."""
@@ -567,6 +569,98 @@ def _score_result(title: str, description: str, url: str, business_name: str, is
 
     return score
 
+def _source_block_for_url(url: str, combined_text: str) -> str:
+    """Return the [n] title/description/URL block in combined_text whose URL line matches `url` exactly, or '' if no such block exist."""
+    if not url:
+        return ""
+    norm_url = url.strip().lower()
+    for block in combined_text.split("\n---\n"):
+        for line in block.splitlines():
+            if line.lower().startswith("url:") and line [4:].strip().lower() == norm_url:
+                return block
+    return ""
+
+def _evidence_supports_name(first: str, last: str, snippet: str, url: str, combined_text: str, business_name: str) -> tuple[bool, str]:
+    """Phase 9: an extraction is only as good as its citation. The model's own
+    transcription of the snippet is untrusted - it doesn't reliably quote
+    verbatim even when it's right. Instead, pull the real source block for
+    the cited URL and check the name against THAT.
+    Returns (passed, reason) so failures are diagnosable"""
+    if not snippet or not url:
+        return False, "missing snippet or url"
+    block = _source_block_for_url(url, combined_text)
+    if not block:
+        return False, "url not one of the cited sources"
+    norm = lambda s: re.sub(r"\s+", " ", s or " ").strip().lower()
+    name_toks = [t for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN")]
+    missing = [t for t in name_toks if norm(t) not in norm(block)]
+    if missing:
+        return False, f"cited source doesn't contain: {', '.join(missing)}"
+    if _is_name_echo_of_business(first, last, business_name):
+        corroboration = min(_independent_corroboration_count(t, combined_text) for t in name_toks) if name_toks else 0
+        if corroboration < 2:
+            return False, f"name echoes business name, only {corroboration} source(s) mention it"
+    return True, "ok"
+
+def _about_evidence_supports_name(first: str, last: str, snippet: str, about_text: str) -> tuple[bool, str]:
+    """Same discipline as _evidence_supports_name, but for the About-page pass:
+    one page, one source - so there's no per-URL block to isolate. Check the name against the actual_text directly."""
+    if not snippet:
+        return False, "missing snippet"
+    norm = lambda s: re.sub(r"\s+", " ", s or " ").strip().lower()
+    name_toks = [t for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN")]
+    missing = [t for t in name_toks if norm(t) not in norm(about_text)]
+    if missing:
+        return False, f"about_text doesn't contain: {', '.join(missing)}"
+    return True, "ok"
+
+SHOP_STOPWORDS = {"barber", "barbershop", "barbers", "shop", "shoppe", "salon", "cuts", "cut",
+                  "hair", "the", "co", "company", "llc", "studio", "lounge", "parlor", "parlour",
+                  "grooming", "kutz", "kuts", "cutz", "blendz", "blends", "room", "house", "club",
+                  "kingdom", "academy", "group"}
+
+def _biz_name_tokens(business_name: str) -> set:
+    """Distinctive words in a business name - generic shop words filtered out
+    so 'Barber Kons the Butcher' -> Kons doesn't trip on 'barber'."""
+    toks = re.findall(r"[a-z']+", business_name.lower())
+    return {t for t in toks if t not in SHOP_STOPWORDS and len(t) > 2}
+
+def _is_name_echo_of_business(first: str, last: str, business_name: str) -> bool:
+    """True when a name token matches a distinctive business-name word - the
+    fabrication signature form the 09-21 audit: 'The Hair Cave' -> Rachel
+    Cave, 'Stanley Barber Shop' -> Andre Stanley, 'Landrys' -> Cordrick Landry."""
+    biz_toks = _biz_name_tokens(business_name)
+    name_toks = {t.lower() for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN" )}
+    return bool(biz_toks & name_toks)
+
+def _independent_corroboration_count(name_part: str, combined_text: str) -> int:
+    """How many distinct source blocks in combined_text mention this name part."""
+    if not name_part:
+        return 0
+    norm = lambda s: re.sub(r"\s+", " ", s or "").strip().lower()
+    target = norm(name_part)
+    return sum(1 for block in combined_text.split("\n---\n") if target in norm(block))
+
+def _calibration_floor(first: str, last: str, title: str, confidence: str) -> tuple[str, str]:
+    """Phase 9: confidence is capped in code, never trusted as self-reported.
+    Root cause (09-21 audit): 'Big Steve', 'Anthony', 'Niki' were marked high
+    with no surname and were wrong. A name with no stand role is 'unclear
+    role', which is no longer a deliverable medium - it's low.
+    Returns (possibly-downgraded confidencem reason)."""
+    last_missing = not last or last.upper() in ("<UNKNOWN>", "<E>", "UNKNOWN")
+    has_nickname_chars = any(c in (first or "") + (last or "") for c in ('"', "'", "(", ")"))
+    title_missing = not title or title.upper() in ("<UNKNOWN>", "")
+
+    if title_missing:
+        if confidence != "low":
+            return "low", f"downgraded {confidence}->low: no role/title stated"
+        return confidence, "ok"
+
+    if (last_missing or has_nickname_chars) and confidence == "high":
+        return "medium", f"downgraded high>medium: {'no last name' if last_missing else 'nickname pattern'}"
+
+    return confidence, "ok"
+
 def extract_owner(state: LeadState) -> dict:
     """Extract owner info from combined source text using Haiku.
     Phase 7: Capture tokens and handle errors."""
@@ -586,6 +680,9 @@ Your task: Identify the primary decision-maker (owner, founder, or manager) from
 - If no name is found, return "Unknown" for first and last name, confidence "low".
 - ONLY use information explicitly stated in the search results.
 
+evidence_snippet: copy the exact sentence or phrase from the search results above that names this person. Verbatim, no paraphrasing. If you can't find such a sentence, return empty string here and confidence "low".
+evidence_url: the URL from the "URL:" line of the source block that snippet came from.
+
 Return JSON with confidence: high (name + clear title), medium (name but unclear role), or low (no clear match)."""
 
     try:
@@ -601,7 +698,44 @@ Return JSON with confidence: high (name + clear title), medium (name but unclear
             raise ValueError(f"Structured parse failed: {output.get('parsing_error')}")
         
         logger.debug(f"Haiku extracted: {response.decision_maker_first_name} {response.decision_maker_last_name} ({response.confidence})")
-        
+
+        evidence_ok, evidence_reason = _evidence_supports_name(
+            response.decision_maker_first_name,
+            response.decision_maker_last_name,
+            response.evidence_snippet,
+            response.evidence_url,
+            combined_text,
+            business_name,
+        )
+        if not evidence_ok:
+            logger.debug(
+                f"Evidence check failed for {response.decision_maker_first_name} {response.decision_maker_last_name} "
+                f"- {evidence_reason} | snippet={response.evidence_snippet!r} | url={response.evidence_url!r}"
+            )
+            return {
+                "decision_maker_first_name": "<UNKNOWN>",
+                "decision_maker_last_name": "<UNKNOWN>",
+                "title": "",
+                "linkedin": "",
+                "instagram": "",
+                "tiktok": "",
+                "facebook": "",
+                "confidence": "low",
+                "why_this_person": "No verbatim evidence for extracted name.",
+                "cost": cost
+            }
+            
+        logger.debug(f"Evidence check passed for {response.decision_maker_first_name} {response.decision_maker_last_name}")
+
+        final_confidence, calib_reason = _calibration_floor(
+            response.decision_maker_first_name,
+            response.decision_maker_last_name,
+            response.title,
+            response.confidence,
+        )
+        if calib_reason != "ok":
+            logger.debug(f"Calibration: {calib_reason}")
+
         return {
             "decision_maker_first_name": response.decision_maker_first_name,
             "decision_maker_last_name": response.decision_maker_last_name,
@@ -610,7 +744,7 @@ Return JSON with confidence: high (name + clear title), medium (name but unclear
             "instagram": response.instagram,
             "tiktok": response.tiktok,
             "facebook": response.facebook,
-            "confidence": response.confidence,
+            "confidence": final_confidence,
             "why_this_person": response.why_this_person,
             "cost": cost
         }
@@ -638,6 +772,7 @@ def verify_owner(state: LeadState) -> dict:
     haiku_first = state["decision_maker_first_name"]
     haiku_last = state["decision_maker_last_name"]
     combined_text = state["combined_source_text"]
+    business_name = state["business_name"]
     cost = state["cost"]
 
     prompt = f"""You are an expert at verifying business decision-maker identification.
@@ -656,6 +791,8 @@ Return JSON:
     "verified_confidence": "high|medium|low",
     "verified_first_name": "...",
     "verified_last_name": "...",
+    "verified_evidence_snippet": "exact sentence from the search results naming this person, or empty string",
+    "verified_evidence_url": "the URL from the source block that snippet came from, or empty string",
     "alternative_first_name": "... or empty string",
     "alternative_last_name": "... or empty string",
     "verification_reasoning": "1-2 sentences"
@@ -685,13 +822,38 @@ Return JSON:
                 "verified_confidence": "low",
                 "verified_first_name": haiku_first,
                 "verified_last_name": haiku_last,
+                "verified_evidence_snippet": "",
+                "verified_evidence_url": "",
                 "alternative_first_name": "",
                 "alternative_last_name": "",
                 "verification_reasoning": "unable to verify"
             }
 
         logger.debug(f"Verification: {verification['verified_first_name']} {verification['verified_last_name']} ({verification['verified_confidence']})")
-        
+
+        evidence_ok, evidence_reason = _evidence_supports_name(
+            verification["verified_first_name"],
+            verification["verified_last_name"],
+            verification.get("verified_evidence_snippet", ""),
+            verification.get("verified_evidence_url", ""),
+            combined_text,
+            business_name,
+        )
+        if not evidence_ok:
+            logger.debug(
+                f"Verify evidence check failed for {verification['verified_first_name']} {verification['verified_last_name']} "
+                f"- {evidence_reason}"
+            )
+            return {
+                "verified_confidence": "low",
+                "decision_maker_first_name": "<UNKNOWN>",
+                "decision_maker_last_name": "<UNKNOWN>",
+                "alternative_first_name": "",
+                "alternative_last_name": "",
+                "verification_reasoning": "No verbatim evidence for verified name.",
+                "cost": cost
+            }
+
         return {
             "verified_confidence": verification["verified_confidence"],
             "decision_maker_first_name": verification["verified_first_name"],
@@ -808,6 +970,9 @@ def extract_owner_from_about(state: LeadState) -> dict:
 Business: {business_name}
 About page text: {about_text}
 
+evidence_snippet: copy the exact sentence or phrase from the About page text above that name this person. Verbatim, no paraphrasing. If you can't find such a sentence, return empty string here and confidence "low"
+evidence_url: leave this as the literal string "about_page" 
+
 Return JSON with confidence: high/medium/low."""
 
     try:
@@ -824,6 +989,21 @@ Return JSON with confidence: high/medium/low."""
             raise ValueError(f"Structured parse failed: {output.get('parsing_error')}")
         
         logger.debug(f"About-page extraction: {response.decision_maker_first_name} {response.decision_maker_last_name} ({response.confidence})")
+
+        evidence_ok, evidence_reason = _about_evidence_supports_name(
+            response.decision_maker_first_name,
+            response.decision_maker_last_name,
+            response.evidence_snippet,
+            about_text,
+        )
+        if not evidence_ok:
+            logger.debug(f"About-page evidence check failed for {response.decision_maker_first_name} {response.decision_maker_last_name} - {evidence_reason}")
+            return {
+                "decision_maker_first_name": "<UNKNOWN>",
+                "decision_maker_last_name": "<UNKNOWN>",
+                "confidence": "low",
+                "cost": cost
+            }
         
         return {
             "decision_maker_first_name": response.decision_maker_first_name,
@@ -837,8 +1017,12 @@ Return JSON with confidence: high/medium/low."""
         return {"confidence": "low", "cost": cost}
 
 def flag_for_review(state: LeadState) -> dict:
+    """Phase 9: no evidence -> blank. Only low-confidence leads reach this node,
+    so any name still in state is unverified and must not be delivered."""
     logger.info("→ No owner found, flagged for manual review")
-    return {}
+    return {"decision_maker_first_name": "<UNKNOWN>",
+            "decision_maker_last_name": "<UNKNOWN>",
+            "title": ""}
 
 def route_after_about(state: LeadState) -> str:
     confidence = state["confidence"]
