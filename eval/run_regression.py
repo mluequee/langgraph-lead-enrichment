@@ -6,6 +6,10 @@ From the repo root, venv active:
     python eval/run_regression.py --subset all     # all 55, incl. the 8 partial rows
     python eval/run_regression.py --rescore eval/data/results_<stamp>.csv   # free
 
+Rows the pipeline's intake filter skips (intake.py: '@' in the name, Place ID
+denylist) are dropped from the run and from every denominator. The ground-truth
+worksheet and ground_truth.json are not edited.
+
 Always prints a cost estimate and asks before spending, unless --yes.
 Results CSV lands in eval/data/ (gitignored: it holds real people's names).
 
@@ -17,6 +21,7 @@ import csv
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -24,12 +29,16 @@ from datetime import datetime
 EVAL = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(EVAL)
 sys.path.insert(0, EVAL)
+sys.path.insert(0, ROOT)
 from scoring import judge, summarize, fmt, norm_tokens  # noqa: E402
+import intake                                             # noqa: E402
 
 GT = os.path.join(EVAL, "data", "ground_truth.json")
+DB = os.path.join(ROOT, "leads.db")
 EST_COST_PER_LEAD = 0.03          # 08-25 run averaged $0.027/lead
-BASELINE = ("Baseline, unmodified code, 2026-09-25, 2 runs: lenient 18/42, 17/42 (~41%) | strict 12/42, 13/42 (~30%) | "
-            "correct blanks 0/4. Noise ~1-2 correct: a fix must reach ~21/42 lenient to be real.")
+BASELINE = ("PRE-A0 baseline (unmodified code, 2026-09-25, 2 runs, 47 audit rows incl. the 3 now excluded by intake): "
+            "lenient 18/42, 17/42 | strict 12/42, 13/42 | correct blanks 0/4. History only: the filtered set has its own "
+            "baseline (stage A0). Noise ~1-2 correct.")
 FIELDS = ["id", "business_name", "subset", "first", "last", "confidence",
           "verified_confidence", "grade", "truth", "why_this_person", "cost_usd", "seconds", "error"]
 
@@ -53,6 +62,42 @@ def graph_input(lead):
         "city": lead.city,
         "state": lead.state,
     }
+
+
+def excluded_rows(rows):
+    """Ground-truth rows the intake filter would skip: {row id: reason}.
+
+    Uses the same rule as the pipeline (intake.skip_reason), applied to each row's
+    business name and to the Place ID of the matching lead in leads.db. The
+    ground-truth worksheet itself is never edited; excluded rows just drop out of
+    every denominator.
+    """
+    place_ids = {}
+    if os.path.exists(DB):
+        conn = sqlite3.connect(DB)
+        for pid, name in conn.execute("SELECT place_id, business_name FROM leads"):
+            place_ids.setdefault(key(name), []).append(pid or "")
+        conn.close()
+    else:
+        print(f"WARNING: {DB} not found. Applying the '@' rule only; the Place ID denylist can't be checked.")
+
+    out = {}
+    for r in rows:
+        reason = intake.skip_reason(r["business_name"])
+        for pid in place_ids.get(r["key"], []):
+            reason = reason or intake.skip_reason(r["business_name"], pid)
+        if reason:
+            out[r["id"]] = reason
+    return out
+
+
+def print_excluded(rows, excluded):
+    if not excluded:
+        return
+    print(f"Intake rule excludes {len(excluded)} ground-truth row(s) from every denominator:")
+    for r in rows:
+        if r["id"] in excluded:
+            print(f"  - {r['business_name']} ({r['subset']}, {r['kind']}): {excluded[r['id']]}")
 
 
 def truth_text(row):
@@ -109,7 +154,7 @@ def run_pipeline(rows, verbose):
     return out
 
 
-def rescore(path, rows):
+def rescore(path, rows, excluded):
     by_id = {r["id"]: r for r in rows}
     out = []
     with open(path, encoding="utf-8") as f:
@@ -117,7 +162,10 @@ def rescore(path, rows):
             row = by_id.get(int(rec["id"]))
             if row is None:
                 continue
-            rec["grade"] = "error" if rec.get("error") else judge(rec["first"], rec["last"], row)
+            if row["id"] in excluded:
+                rec["grade"] = "excluded"                 # skipped at intake: not in any denominator
+            else:
+                rec["grade"] = "error" if rec.get("error") else judge(rec["first"], rec["last"], row)
             rec["truth"] = truth_text(row)
             out.append(rec)
     return out
@@ -170,11 +218,16 @@ def main():
     with open(GT, encoding="utf-8") as f:
         gt = json.load(f)
 
+    excluded = excluded_rows(gt)
+    print_excluded(gt, excluded)
+
     if a.rescore:
-        report(rescore(a.rescore, gt))
+        report(rescore(a.rescore, gt, excluded))
         return
 
-    rows = select(gt, a.subset, a.limit)
+    rows = [r for r in select(gt, a.subset, 0) if r["id"] not in excluded]
+    if a.limit:
+        rows = rows[:a.limit]
     est = len(rows) * EST_COST_PER_LEAD
     print(f"About to run the pipeline on {len(rows)} shop(s). Estimated cost ~${est:.2f} (Anthropic + Brave).")
     if not a.yes and input("Proceed? [y/N] ").strip().lower() != "y":

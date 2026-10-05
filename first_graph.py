@@ -22,6 +22,8 @@ if sys.platform == 'win32':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 from datetime import datetime
 
+import intake
+
 py_logging.getLogger("anthropic").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain_anthropic").setLevel(py_logging.WARNING)
@@ -41,6 +43,7 @@ class Lead:
     phone: str = ""
     city: str = ""
     state: str = ""
+    place_id: str = ""
 
 @dataclass
 class LeadCost:
@@ -88,7 +91,7 @@ class LeadDatabase:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        cursor.execute("SELECT id, business_name, website, address, phone, city, state FROM leads")
+        cursor.execute("SELECT id, place_id, business_name, website, address, phone, city, state FROM leads")
         rows = cursor.fetchall()
         conn.close()
 
@@ -101,6 +104,7 @@ class LeadDatabase:
                 phone=row['phone'] or "",
                 city=row['city'] or "",
                 state=row['state'] or "",
+                place_id=row['place_id'] or "",
             )
             for row in rows
         ]
@@ -1319,7 +1323,10 @@ class AccuracyComparison:
 def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte_Barbershops__7_.csv"):
     """Process multiple leads from database and compare to n8n baseline."""
     db = LeadDatabase()
-    leads = db.get_all_leads()[:5]
+    leads, skipped = intake.filter_leads(db.get_all_leads(), log=logger)
+    skipped_path = intake.write_skipped_file(skipped)
+    logger.info(f"Skipped leads written to {skipped_path}")
+    leads = leads[:5]
 
     logger.info(f"\n{'='*80}")
     logger.info(f"PHASE 7: BATCH PROCESSING + COST TRACKING + ACCURACY COMPARISON")
