@@ -1326,7 +1326,6 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
     leads, skipped = intake.filter_leads(db.get_all_leads(), log=logger)
     skipped_path = intake.write_skipped_file(skipped)
     logger.info(f"Skipped leads written to {skipped_path}")
-    leads = leads[:5]
 
     logger.info(f"\n{'='*80}")
     logger.info(f"PHASE 7: BATCH PROCESSING + COST TRACKING + ACCURACY COMPARISON")
