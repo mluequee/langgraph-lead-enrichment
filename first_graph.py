@@ -4,6 +4,7 @@ from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from dataclasses import dataclass
+import difflib
 import os
 import re
 import requests
@@ -24,6 +25,8 @@ from datetime import datetime
 py_logging.getLogger("anthropic").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain_anthropic").setLevel(py_logging.WARNING)
+for _noisy in ("httpx", "httpcore", "urllib3"):
+    py_logging.getLogger(_noisy).setLevel(py_logging.WARNING)
 load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
@@ -225,6 +228,15 @@ class LeadState(TypedDict):
 
 structured_model = extract_model.with_structured_output(OwnerResult, include_raw=True)
 
+# Phase 10: one encoding for "no name" everywhere (was <UNKNOWN>, <E>, <ERROR>, UNKNOWN, empty).
+NO_NAME = {"", "<UNKNOWN>", "<E>", "<ERROR>", "UNKNOWN", "N/A", "NA", "NONE"}
+
+def _is_no_name(s: str)-> bool:
+    return (s or "").strip().upper() in NO_NAME
+
+def _clean_name(s: str) -> str:
+    """Canonical 'no name' is <UNKNOWN>. Stops 'Greg UNKNOWN' leaking into results."""
+    return "<UNKNOWN>" if _is_no_name(s) else s.strip()
 # Phase 8: Identity anchor - location gate + about-page targeting
 
 US_STATES = {
@@ -243,7 +255,19 @@ US_STATES = {
 
 # Booksy/thecut/Square/Vagaro/StyleSeat: booking platforms, never the shop's own domain.
 BOOKING_PLATFORM_DOMAINS = ("booksy.com", "thecut.co", "squareup.com", "square.site", "vagaro.com", "styleseat.com")
-
+# Phase 10: Pages that are never the shop's OWN site. About-page fetch on these would read
+# the platform's corporate page (linktr.ee/about, feacebook.com/about), not the shop's.
+NOT_OWN_SITE_DOMAINS = BOOKING_PLATFORM_DOMAINS + (
+    "facebook.com", "instagram.com", "linktr.ee", "tiktok.com", "linkedin.com", "yelp.com", "google.com" 
+)
+# Phase 10: retrieval weight = who survives the top-8 cut. NOT trust (authority comes later).
+# Starting weights, not tuned: BBB outranks a bare Instagram URL (60) but not a phone/address anchor (100).
+RETRIEVAL_BOOST = {"bbb.org": 70, "booksy.com": 35, "yelp.com": 35}
+# Phase 10: inline Goggle. Re-ranks inside Brave, so it changes WHICH results come back.
+# Newline-delimited rules, strength 1-10 Starting weight, not tuned.
+OWNER_SOURCES_GOGGLE = "\n".join(
+    f"$boost=4,site={d}" for d in ("bbb.org", "linkedin.com", "booksy.com", "yelp.com")
+)
 
 def _phone_digits(phone: str) -> str:
     """Last 10 digits of a phone number, for comparing across formats."""
@@ -320,7 +344,7 @@ def _is_booking_platform(url: str) -> bool:
     if not url:
         return False
     netloc = urlparse(url).netloc.lower()
-    return any(d in netloc for d in BOOKING_PLATFORM_DOMAINS)
+    return any(d in netloc for d in NOT_OWN_SITE_DOMAINS)
 
 
 def _resolve_fallback_website(search_results: list[dict], phone: str) -> str:
@@ -335,6 +359,80 @@ def _resolve_fallback_website(search_results: list[dict], phone: str) -> str:
             if _phone_digits(loc.get("phone", "")) == phone_digits:
                 return loc.get("url", "")
     return ""
+
+def _bbb_url_names_other_place(url: str, lead_city: str, lead_state: str) -> bool:
+    """BBB profile URLs embed the place: /us/nc/black-mountain/profile/...
+    Snippets often omit the address, so read the place from the URL."""
+    m = re.search(r"bbb\.org/us/([a-z]{2})/([a-z0-9-]+)/", (url or "").lower())
+    if not m:
+        return False
+    st, city_slug = m.group(1), m.group(2)
+    if lead_state and st != lead_state.lower():
+        return True
+    lead_slug = re.sub(r"[^a-z0-9]+", "-", (lead_city or "").lower()).strip("-")
+    return bool (lead_slug) and city_slug != lead_slug
+
+def _booksy_url_names_other_place(url: str, lead_city: str) -> bool:
+    """Booksy URLs end in the place: .../1254405_name_barber-shop_26689_gastonia.
+    Same idea as the BBB gate:snippets rarely say where, the URL does."""
+    u = (url or "").lower()
+    if "booksy.com" not in u or not lead_city:
+        return False
+    m = re.search(r"_\d+_([a-z][a-z0-9-]*)/?(?:[?#].*)?$", u)
+    if not m:
+        return False
+    lead_slug = re.sub(r"[^a-z0-9]+", "-", lead_city.lower()).strip("-")
+    return m.group(1) != lead_slug
+
+# Phase 10: relevance gate. A result must be about THIS shop to reach the model.
+GENERIC_NAME_WORDS = {
+    "the", "and", "of", "inc", "llc", "co", "company", "corp",
+    "barber", "barbers", "barbering", "barbershop", "barbershops", "shop", "shoppe",
+    "salon", "lounge", "studio", "room", "cuts", "cut", "haircuts", "grooming",
+    "center", "men", "mens", "unisex", "historic",
+    "charlotte", "nc", "blvd", "st", "university", "city",
+}
+_NAME_CUT = r"\s[-|@]\s|/|\("   # name junk: ' - city', ' @ x', URLs, '(notes)'
+
+def _norm_words(s: str) -> list[str]:
+    s = (s or "").lower().replace("'", "").replace("\u2019", "")
+    return re.sub(r"[^a-z0-9]+", " ", s).split()
+
+def _brand_tokens(business_name: str) -> list[str]:
+    """The distinctive words of a shop name (max 2), generic words dropped."""
+    cut = re.split(_NAME_CUT, business_name or "")[0]
+    toks = [t for t in _norm_words(cut) if t not in GENERIC_NAME_WORDS and (len(t) > 1 or t.isdigit())]
+    return toks[:2]
+
+BBB_OK_CATEGORY_HINTS = ("barber", "hair", "beauty", "salon", "groom")
+
+def _bbb_wrong_industry(url: str) -> bool:
+    """BBB profile URLs carry the industry: .../profile/barber/..., .../profile/auto-repair/...
+    A same-named business in another industry is not this shop."""
+    m = re.search(r"bbb\.org/us/[a-z]{2}/[a-z0-9-]+/profile/([a-z0-9-]+)/", (url or "").lower())
+    if not m:
+        return False
+    return not any(h in m.group(1) for h in BBB_OK_CATEGORY_HINTS)
+
+def _has_token(tok: str, words: list[str], squash: str = "") -> bool:
+    if tok in words:
+        return True
+    # run-together spellings: '@theelectbarbershop', 'Wil-Mar' vs 'Wilmar'
+    if len(tok) >= 6 and tok in squash:
+        return True
+    return len(tok) >= 6 and bool(difflib.get_close_matches(tok, words, n=1, cutoff=0.85))
+
+def _result_is_about_shop(title: str, description: str, url: str, business_name: str) -> bool:
+    if _bbb_wrong_industry(url):
+        return False
+    words = _norm_words(f"{title} {description} {url}")
+    squash = "".join(_norm_words(f"{title} {url}"))
+    brand = _brand_tokens(business_name)
+    if brand:
+        return all(_has_token(t, words, squash) for t in brand)
+    cut = re.split(_NAME_CUT, business_name or "")[0]
+    phrase = " ".join(w for w in _norm_words(cut) if w != "the")
+    return bool(phrase) and f" {phrase} " in f" {' '.join(words)} "
 
 
 def prep_lead(state: LeadState) -> dict:
@@ -384,11 +482,12 @@ def build_queries(state: LeadState) -> dict:
 
     queries = [
         f"{anchor} owner",
-        f"{anchor} founded barber",
-        f"{anchor} instagram",
-        f"{anchor} decision maker",
+        f"{anchor} site:linkedin.com owner",
+        f"{anchor} site:bbb.org",
+        f"{anchor} site:booksy.com",
+        f"{anchor} instagram"
     ]
-    logger.debug(f"Built 4 queries for '{business_name}':\n" + "\n".join(f" Q{i+1}: {q}" for i, q in enumerate(queries)))
+    logger.debug(f"Built {len(queries)} for '{business_name}':\n" + "\n".join(f" Q{i+1}: {q}" for i, q in enumerate(queries)))
     return {"queries": queries}
 
 def search_q1(state: LeadState) -> dict:
@@ -403,6 +502,9 @@ def search_q3(state: LeadState) -> dict:
 def search_q4(state: LeadState) -> dict:
     return _brave_search(state, query_index=3)
 
+def search_q5(state: LeadState) -> dict:
+    return _brave_search(state, query_index=4)
+
 def _brave_search(state: LeadState, query_index: int) -> dict:
     """Execute one Brave search and return results as a list (for reducer).
     Phase 7: Track Brave calls in cost object."""
@@ -413,7 +515,7 @@ def _brave_search(state: LeadState, query_index: int) -> dict:
     }
 
     query = state["queries"][query_index]
-    params = {"q": query}
+    params = {"q": query, "goggles": OWNER_SOURCES_GOGGLE}
 
     logger.debug(f"Searching Q{query_index + 1}: '{query}'...")
 
@@ -473,6 +575,7 @@ def combine_and_score(state: LeadState) -> dict:
 
     all_results_with_scores = []
     discarded_wrong_location = 0
+    discarded_irrelevant = 0
 
     for search_set in state["search_results"]:
         results = search_set.get("results", [])
@@ -489,11 +592,18 @@ def combine_and_score(state: LeadState) -> dict:
                 continue
 
             if _names_other_state(title_raw, description_raw, lead_state) or \
-               _names_other_city(title_raw, description_raw, lead_city, lead_state):
+               _names_other_city(title_raw, description_raw, lead_city, lead_state) or \
+               _bbb_url_names_other_place(url, lead_city, lead_state) or \
+               _booksy_url_names_other_place(url, lead_city):
                 discarded_wrong_location += 1
                 continue
 
             is_anchor = _is_anchor_result(title_raw, description_raw, url, lead_phone, lead_address)
+            # Phase 10: unless it carries the lead's own phone/address, a result
+            # must be about THIS shop to reach the model.
+            if not is_anchor and not _result_is_about_shop(title_raw, description_raw, url, state["business_name"]):
+                discarded_irrelevant += 1
+                continue
 
             score = _score_result(title, description, url, business_name, is_anchor)
 
@@ -506,6 +616,8 @@ def combine_and_score(state: LeadState) -> dict:
 
     if discarded_wrong_location:
         logger.debug(f"Location gate discarded {discarded_wrong_location} result(s) naming another state")
+    if discarded_irrelevant:
+        logger.debug(f"Relevance gate discarded {discarded_irrelevant} result(s) not about this shop")
 
     # Dedupe by URL (keep first occurrence)
     seen_urls = set()
@@ -518,6 +630,8 @@ def combine_and_score(state: LeadState) -> dict:
     # Sort by score (descending) and take top 8
     deduped.sort(key=lambda x: x["score"], reverse=True)
     top_results = deduped[:8]
+    if not top_results:
+        logger.info(f"-> No usable results survived the gates for {state['business_name']}")
 
     # Combine into one text string (40k char cap)
     combined_text = "\n---\n".join(
@@ -554,6 +668,10 @@ def _score_result(title: str, description: str, url: str, business_name: str, is
         score += 40
     if "linkedin" in url:
         score += 45
+    # Phase 10: boost the sources where owners were actually found (hand audit)
+    for domain, boost in RETRIEVAL_BOOST.items():
+        if domain in url:
+            score += boost
 
     # Content signals
     if "owner" in title or "owner" in description:
@@ -592,7 +710,8 @@ def _evidence_supports_name(first: str, last: str, snippet: str, url: str, combi
     if not block:
         return False, "url not one of the cited sources"
     norm = lambda s: re.sub(r"\s+", " ", s or " ").strip().lower()
-    name_toks = [t for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN")]
+    name_toks = [t for t in (first, last) if not
+                 _is_no_name(t)]
     missing = [t for t in name_toks if norm(t) not in norm(block)]
     if missing:
         return False, f"cited source doesn't contain: {', '.join(missing)}"
@@ -608,7 +727,8 @@ def _about_evidence_supports_name(first: str, last: str, snippet: str, about_tex
     if not snippet:
         return False, "missing snippet"
     norm = lambda s: re.sub(r"\s+", " ", s or " ").strip().lower()
-    name_toks = [t for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN")]
+    name_toks = [t for t in (first, last) if not
+                 _is_no_name(t)]
     missing = [t for t in name_toks if norm(t) not in norm(about_text)]
     if missing:
         return False, f"about_text doesn't contain: {', '.join(missing)}"
@@ -630,7 +750,8 @@ def _is_name_echo_of_business(first: str, last: str, business_name: str) -> bool
     fabrication signature form the 09-21 audit: 'The Hair Cave' -> Rachel
     Cave, 'Stanley Barber Shop' -> Andre Stanley, 'Landrys' -> Cordrick Landry."""
     biz_toks = _biz_name_tokens(business_name)
-    name_toks = {t.lower() for t in (first, last) if t and t.upper() not in ("<UNKNOWN>", "<E>", "UNKNOWN" )}
+    name_toks = {t.lower() for t in (first, last) if not 
+                 _is_no_name(t)}
     return bool(biz_toks & name_toks)
 
 def _independent_corroboration_count(name_part: str, combined_text: str) -> int:
@@ -647,7 +768,7 @@ def _calibration_floor(first: str, last: str, title: str, confidence: str) -> tu
     with no surname and were wrong. A name with no stand role is 'unclear
     role', which is no longer a deliverable medium - it's low.
     Returns (possibly-downgraded confidencem reason)."""
-    last_missing = not last or last.upper() in ("<UNKNOWN>", "<E>", "UNKNOWN")
+    last_missing = _is_no_name(last)
     has_nickname_chars = any(c in (first or "") + (last or "") for c in ('"', "'", "(", ")"))
     title_missing = not title or title.upper() in ("<UNKNOWN>", "")
 
@@ -737,8 +858,8 @@ Return JSON with confidence: high (name + clear title), medium (name but unclear
             logger.debug(f"Calibration: {calib_reason}")
 
         return {
-            "decision_maker_first_name": response.decision_maker_first_name,
-            "decision_maker_last_name": response.decision_maker_last_name,
+            "decision_maker_first_name": _clean_name(response.decision_maker_first_name),
+            "decision_maker_last_name": _clean_name(response.decision_maker_last_name),
             "title": response.title,
             "linkedin": response.linkedin,
             "instagram": response.instagram,
@@ -856,8 +977,8 @@ Return JSON:
 
         return {
             "verified_confidence": verification["verified_confidence"],
-            "decision_maker_first_name": verification["verified_first_name"],
-            "decision_maker_last_name": verification["verified_last_name"],
+            "decision_maker_first_name": _clean_name(verification["verified_first_name"]),
+            "decision_maker_last_name": _clean_name(verification["verified_last_name"]),
             "alternative_first_name": verification["alternative_first_name"],
             "alternative_last_name": verification["alternative_last_name"],
             "verification_reasoning": verification["verification_reasoning"],
@@ -889,6 +1010,11 @@ def route_after_search(state: LeadState) -> str:
 
 def route_after_verification(state: LeadState) -> str:
     verified_confidence = state["verified_confidence"]
+    # Phase 10: no evidence -> blank. If Haiku could not back any name with evidence
+    # (confidence low), a name Sonnet proposes on its own is not deliverable.
+    # Saved runs: 2 such rescues, both wrong (Dave, Hendu).
+    if state["confidence"] == "low":
+        verified_confidence = "low"
     if verified_confidence in ["high", "medium"]:
         logger.info(f"Verified {verified_confidence} confidence, sending to END")
         return "end"
@@ -1006,8 +1132,8 @@ Return JSON with confidence: high/medium/low."""
             }
         
         return {
-            "decision_maker_first_name": response.decision_maker_first_name,
-            "decision_maker_last_name": response.decision_maker_last_name,
+            "decision_maker_first_name": _clean_name(response.decision_maker_first_name),
+            "decision_maker_last_name": _clean_name(response.decision_maker_last_name),
             "confidence": response.confidence,
             "cost": cost
         }
@@ -1042,6 +1168,7 @@ graph.add_node("search_q1", search_q1)
 graph.add_node("search_q2", search_q2)
 graph.add_node("search_q3", search_q3)
 graph.add_node("search_q4", search_q4)
+graph.add_node("search_q5", search_q5)
 graph.add_node("combine_and_score", combine_and_score)
 graph.add_node("extract_owner", extract_owner)
 graph.add_node("verify_owner", verify_owner)
@@ -1055,10 +1182,12 @@ graph.add_edge("build_queries", "search_q1")
 graph.add_edge("build_queries", "search_q2")
 graph.add_edge("build_queries", "search_q3")
 graph.add_edge("build_queries", "search_q4")
+graph.add_edge("build_queries", "search_q5")
 graph.add_edge("search_q1", "combine_and_score")
 graph.add_edge("search_q2", "combine_and_score")
 graph.add_edge("search_q3", "combine_and_score")
 graph.add_edge("search_q4", "combine_and_score")
+graph.add_edge("search_q5", "combine_and_score")
 graph.add_edge("combine_and_score", "extract_owner")
 
 graph.add_conditional_edges(
