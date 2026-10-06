@@ -79,5 +79,99 @@ check("different people disagree", not rg.same_person(B("Greg", "Furr"), B("Hunt
 check("blank vs blank agree", rg.same_person(B("<UNKNOWN>", "<UNKNOWN>"), B("", "")))
 check("blank vs named disagree", not rg.same_person(B("<UNKNOWN>", "<UNKNOWN>"), B("Greg", "Furr")))
 
+# --- Empty-response retry (fake calls, no network) ---------------------------------------------
+import csv                                                  # noqa: E402
+import tempfile                                             # noqa: E402
+from types import SimpleNamespace                           # noqa: E402
+
+EMPTY = {"usageMetadata": {"promptTokenCount": 1000, "thoughtsTokenCount": 3000, "totalTokenCount": 4000}}   # no candidates
+EMPTY_PARTS = {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}
+THOUGHT_ONLY = {"candidates": [{"content": {"parts": [{"text": "thinking...", "thought": True}]}}]}
+GOOD = RESP
+
+
+class FakeCalls:
+    """Stands in for call_gemini: returns the queued (resp, err) pairs in order and counts calls."""
+    def __init__(self, *queue):
+        self.queue, self.n = list(queue), 0
+
+    def __call__(self, prompt, model, key):
+        self.n += 1
+        return self.queue.pop(0)
+
+
+check("is_empty: no candidates", rg.is_empty(EMPTY))
+check("is_empty: candidate with no parts", rg.is_empty(EMPTY_PARTS))
+check("is_empty: thought-only parts", rg.is_empty(THOUGHT_ONLY))
+check("is_empty: a real answer is not empty", not rg.is_empty(GOOD))
+
+lines = []
+f = FakeCalls((GOOD, ""))
+resp, err, retries, spent = rg.ask_with_retry("p", "gemini-3.8-flash", "k", "Shop A", call=f, log=lines.append)
+check("non-empty first response: one call, no retry, no log", (f.n, retries, err, lines) == (1, 0, "", []) and resp is GOOD)
+
+lines = []
+f = FakeCalls((EMPTY, ""), (GOOD, ""))
+resp, err, retries, spent = rg.ask_with_retry("p", "gemini-3.8-flash", "k", "Shop B", call=f, log=lines.append)
+check("empty then answer: exactly 2 calls, recovered, no error", f.n == 2 and retries == 1 and err == "" and resp is GOOD)
+check("recovered retry is logged (row, attempt, outcome)",
+      len(lines) == 2 and "Shop B" in lines[0] and "attempt=2" in lines[0] and "outcome=recovered" in lines[1])
+check("the empty first reply's tokens are still counted as spend", spent > 0)
+
+lines = []
+f = FakeCalls((EMPTY, ""), (EMPTY, ""), (GOOD, ""))
+resp, err, retries, spent = rg.ask_with_retry("p", "gemini-3.8-flash", "k", "Shop C", call=f, log=lines.append)
+check("empty twice: retries ONCE only (2 calls, never a third)", f.n == 2 and retries == 1)
+check("empty twice: returns an error, not a blank", err.startswith("empty response after retry"))
+check("empty twice is logged as still empty -> error", len(lines) == 2 and "still empty" in lines[1] and "-> error" in lines[1])
+
+lines = []
+f = FakeCalls((EMPTY, ""), (None, "HTTP 503: unavailable"))
+resp, err, retries, spent = rg.ask_with_retry("p", "gemini-3.8-flash", "k", "Shop D", call=f, log=lines.append)
+check("empty then HTTP error: error row, 2 calls", f.n == 2 and retries == 1 and "retry failed" in err and resp is None)
+
+lines = []
+f = FakeCalls((None, "HTTP 429: quota"), (GOOD, ""))
+resp, err, retries, spent = rg.ask_with_retry("p", "gemini-3.8-flash", "k", "Shop E", call=f, log=lines.append)
+check("first-call HTTP error is NOT an empty-response retry", f.n == 1 and retries == 0 and err.startswith("HTTP 429") and lines == [])
+
+# End to end through run(): the CSV keeps blank and error separate.
+NO_OWNER_TEXT = ('No source names an owner.\n{"owner_first_name": null, "owner_last_name": null, '
+                 '"goes_by_name": null, "title": null, "confidence": "low", "source_urls": []}')
+BLANK_RESP = {"candidates": [{"content": {"parts": [{"text": NO_OWNER_TEXT}]}, "finishReason": "STOP"}]}
+rows = [{"id": i, "business_name": n, "subset": "audit", "key": n.lower(), "kind": "no_owner", "owners": []}
+        for i, n in ((1, "Blank Shop"), (2, "Empty Twice Shop"), (3, "Recovered Shop"))]
+leads = {r["key"]: {"business_name": r["business_name"], "address": "", "city": "", "state": "", "phone": "", "website": ""}
+         for r in rows}
+queue = {"Blank Shop": [(BLANK_RESP, "")], "Empty Twice Shop": [(EMPTY, ""), (EMPTY, "")], "Recovered Shop": [(EMPTY, ""), (BLANK_RESP, "")]}
+
+
+def fake_call(prompt, model, key):
+    name = prompt.split("Business: ")[1].split("\n")[0]
+    return queue[name].pop(0)
+
+
+real_call, rg.call_gemini = rg.call_gemini, fake_call
+try:
+    log = []
+    gated, raw = rg.run(rows, leads, SimpleNamespace(model="gemini-3.8-flash", max_errors=3, show_shape=False), "k", log)
+finally:
+    rg.call_gemini = real_call
+by = {r["business_name"]: r for r in gated}
+check("a real 'no owner' answer is a blank with status ok",
+      by["Blank Shop"]["grade"] == "correct_blank" and by["Blank Shop"]["status"] == "ok" and by["Blank Shop"]["retries"] == 0)
+check("empty twice is status error, grade error, not a blank",
+      by["Empty Twice Shop"]["status"] == "error" and by["Empty Twice Shop"]["grade"] == "error" and by["Empty Twice Shop"]["error"])
+check("recovered row is a normal answer that records retries=1",
+      by["Recovered Shop"]["status"] == "ok" and by["Recovered Shop"]["retries"] == 1 and by["Recovered Shop"]["grade"] == "correct_blank")
+check("run() logs every retry", sum("RETRY" in line for line in log) == 4)
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "r.csv")
+    rg.write_csv(path, gated)
+    back = {r["business_name"]: r for r in csv.DictReader(open(path, encoding="utf-8"))}
+check("CSV keeps the two cases apart (status ok/blank vs error, with a retries column)",
+      back["Blank Shop"]["status"] == "ok" and back["Empty Twice Shop"]["status"] == "error"
+      and back["Empty Twice Shop"]["error"] and not back["Blank Shop"]["error"] and back["Recovered Shop"]["retries"] == "1")
+
 print("\nGemini harness tests passed." if not failures else f"\n{len(failures)} FAILED: {failures}")
 sys.exit(1 if failures else 0)

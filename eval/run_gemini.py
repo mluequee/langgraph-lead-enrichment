@@ -59,7 +59,8 @@ EST_COST_PER_ROW = 0.045   # list price incl. searches; smoke test: $0.043/row (
 A0_RUNS = ["eval/data/results_20261005_074654.csv", "eval/data/results_20261005_080444.csv"]
 EXTRA = ["goes_by", "title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
          "search_queries", "raw_first", "raw_last", "tokens",
-         "finish_reason", "block_reason", "prompt_tokens", "tooluse_tokens", "thought_tokens", "output_tokens"]
+         "finish_reason", "block_reason", "prompt_tokens", "tooluse_tokens", "thought_tokens", "output_tokens",
+         "status", "retries"]
 NULLISH = {"", "null", "none", "n/a", "na", "unknown", "<unknown>"}
 
 PROMPT = """You are researching a local business to find its owner.
@@ -227,6 +228,37 @@ def call_gemini(prompt, model, api_key):
     return None, last
 
 
+def is_empty(resp):
+    """No answer text at all: no candidates, no parts, or only thought parts."""
+    return not answer_text(resp).strip()
+
+
+def ask_with_retry(prompt, model, api_key, name, call=None, log=print):
+    """One grounded call. If the response comes back EMPTY, retry once; nothing else is retried here
+    (HTTP errors are already retried inside call_gemini). The prompt and request are identical.
+
+    Returns (resp, error, retries, spent): error is "" on success. An empty response that is still empty
+    after the retry is an ERROR, never a blank; a blank is a real answer ("no owner found")."""
+    call = call or call_gemini
+    resp, err = call(prompt, model, api_key)
+    if err or not is_empty(resp):
+        return resp, err, 0, 0.0
+    spent = estimate_cost(model, resp.get("usageMetadata") or {}, 0)     # an empty reply still bills tokens
+    d = diagnostics(resp)
+    log(f"RETRY row={name!r} attempt=2 reason=empty response (finish={d['finish_reason']}, block={d['block_reason'] or '-'})")
+    resp2, err2 = call(prompt, model, api_key)
+    if err2:
+        log(f"RETRY row={name!r} attempt=2 outcome=http error ({err2[:100]}) -> error")
+        return None, f"empty response, then the retry failed: {err2}", 1, spent
+    if is_empty(resp2):
+        d2 = diagnostics(resp2)
+        log(f"RETRY row={name!r} attempt=2 outcome=still empty (finish={d2['finish_reason']}, block={d2['block_reason'] or '-'}) -> error")
+        spent += estimate_cost(model, resp2.get("usageMetadata") or {}, 0)
+        return resp2, f"empty response after retry (finish={d2['finish_reason']}, block={d2['block_reason'] or '-'})", 1, spent
+    log(f"RETRY row={name!r} attempt=2 outcome=recovered")
+    return resp2, "", 1, spent
+
+
 def load_leads():
     """Same lookup run_regression uses: keyed on the normalized name, last lead wins."""
     if not os.path.exists(DB):
@@ -249,20 +281,30 @@ def make_rec(row, ans, first, last, why, extra, cost, secs, err):
     return rec
 
 
-def run(rows, leads, args, api_key):
+def run(rows, leads, args, api_key, retry_log=None):
     gated, raw = [], []
     streak = 0
+    retry_log = retry_log if retry_log is not None else []
+
+    def log(line):
+        print(line)
+        retry_log.append(line)
+
     for i, row in enumerate(rows, 1):
         lead = leads[row["key"]]
         t0 = time.time()
-        resp, err = call_gemini(build_prompt(lead), args.model, api_key)
+        resp, err, retries, spent = ask_with_retry(build_prompt(lead), args.model, api_key,
+                                                   row["business_name"], call=call_gemini, log=log)
         secs = time.time() - t0
         if err:
             streak += 1
             blank = {"goes_by": "", "title": "", "source_urls": "", "source_titles": "", "model_urls": "",
-                     "supported": "", "gate_reason": "", "search_queries": "", "raw_first": "", "raw_last": "", "tokens": 0}
+                     "supported": "", "gate_reason": "", "search_queries": "", "raw_first": "", "raw_last": "", "tokens": 0,
+                     "status": "error", "retries": retries}
+            if resp:
+                blank.update(diagnostics(resp))
             for out in (gated, raw):
-                out.append(make_rec(row, None, "", "", "", blank, 0.0, secs, err))
+                out.append(make_rec(row, None, "", "", "", blank, spent, secs, err))
             print(f"[{i}/{len(rows)}] {row['business_name'][:40]:40} -> ERROR {err[:80]}")
             if streak >= args.max_errors:
                 print(f"\nStopping: {streak} errors in a row. Fix the cause before spending more.")
@@ -273,7 +315,7 @@ def run(rows, leads, args, api_key):
         ans, prose = parse_answer(text)
         g = extract_grounding(resp)
         usage = resp.get("usageMetadata") or {}
-        cost = estimate_cost(args.model, usage, len(g["queries"]))
+        cost = estimate_cost(args.model, usage, len(g["queries"])) + spent
         if ans is None:
             ok, sources, reason = False, [], "answer had no parseable JSON"
         else:
@@ -284,7 +326,7 @@ def run(rows, leads, args, api_key):
                  "model_urls": " | ".join((ans or {}).get("model_urls", [])),
                  "supported": ok, "gate_reason": reason, "search_queries": " | ".join(g["queries"]),
                  "raw_first": (ans or {}).get("first") or "", "raw_last": (ans or {}).get("last") or "",
-                 "tokens": usage.get("totalTokenCount", 0)}
+                 "tokens": usage.get("totalTokenCount", 0), "status": "ok", "retries": retries}
         diag = diagnostics(resp)
         extra.update(diag)
         why = prose or text
@@ -301,6 +343,10 @@ def run(rows, leads, args, api_key):
             print(f"    sources: {extra['source_urls'] or '(none)'} [{extra['source_titles']}]")
             print(f"    diag: {diag} | response keys {sorted(resp)}")
     return gated, raw
+
+
+def errors_with_retry(errors):
+    return [r for r in errors if int(r.get("retries") or 0) > 0]
 
 
 def write_csv(path, recs):
@@ -344,12 +390,16 @@ def compare(gem_path, brave_paths, gt, excluded):
     print("Counts are over the rows Gemini actually answered (a stopped run covers fewer rows); "
           "'lenient'/'strict' are correct answers out of the owner-bearing rows, 'blanks' correct blanks out of no-owner rows.")
 
+    err_rows = [r for r in rescore(gem_path, gt, excluded) if r["grade"] == "error"]
+    if err_rows:
+        print(f"ERROR rows (status 'error', NOT scored as blanks, left out of the disagreement list): "
+              + ", ".join(r["business_name"] for r in err_rows))
     brave = [{r["id"]: r for r in rs} for _, rs in sets[:len(brave_paths)]]
     said = lambda r: (f"{r['first']} {r['last']}".replace("<UNKNOWN>", "").strip() or "-")[:22]
     rows = []
     for rid, g in gem.items():
         bs = [b[rid] for b in brave if rid in b]
-        if bs and any(not same_person(g, b) for b in bs):
+        if bs and g["grade"] != "error" and any(not same_person(g, b) for b in bs):
             rows.append((g, bs))
     print(f"\nRows where Gemini and the Brave path disagree ({len(rows)} of {len(gem)}):")
     print(f"{'business':36} {'truth':26} {'Brave run1':26} {'Brave run2':26} {'Gemini gated':26}")
@@ -416,12 +466,19 @@ def main():
     if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
         raise SystemExit("Cancelled. Nothing was spent.")
 
-    gated, raw = run(rows, leads, args, api_key)
+    retry_log = []
+    gated, raw = run(rows, leads, args, api_key, retry_log)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(EVAL, "data", f"results_gemini_{stamp}.csv")
     write_csv(path, gated)
     write_csv(path.replace(".csv", "_raw.csv"), raw)
+    if retry_log:
+        with open(path.replace(".csv", "_retries.log"), "w", encoding="utf-8") as f:
+            f.write("\n".join(retry_log) + "\n")
     errors = [r for r in gated if r["grade"] == "error"]
+    retried = sum(int(r.get("retries") or 0) for r in gated)
+    print(f"Empty-response retries: {retried} ({retried - len(errors_with_retry(errors))} recovered, "
+          f"{len(errors_with_retry(errors))} ended as errors). Errors are status 'error', not blanks.")
     print(f"\nCost this run (list price, upper bound): ${sum(r['cost_usd'] for r in gated):.2f}"
           f"; {len(errors)} error row(s) are not scored. Saved: {path}")
     if len(errors) < len(gated):
