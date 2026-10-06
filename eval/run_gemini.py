@@ -55,7 +55,7 @@ PRICES = {
     "gemini-3.8-flash": {"in": 0.75, "out": 3.75, "search": 14 / 1000},   # billed per search query run
     "gemini-2.5-flash": {"in": 0.30, "out": 2.50, "search": 35 / 1000},   # billed per grounded prompt
 }
-EST_COST_PER_ROW = 0.03
+EST_COST_PER_ROW = 0.045   # list price incl. searches; smoke test: $0.043/row (token cost alone ~$0.01)
 A0_RUNS = ["eval/data/results_20261005_074654.csv", "eval/data/results_20261005_080444.csv"]
 EXTRA = ["goes_by", "title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
          "search_queries", "raw_first", "raw_last", "tokens"]
@@ -132,6 +132,19 @@ def extract_grounding(resp):
         out["supports"].append({"text": (s.get("segment") or {}).get("text", ""),
                                 "indices": list(s.get("groundingChunkIndices") or [])})
     return out
+
+
+def response_shape(resp):
+    """Which grounding fields the response actually carried (counts and key names only, no content)."""
+    cand = (resp.get("candidates") or [{}])[0]
+    gm = cand.get("groundingMetadata")
+    shape = {"candidate_keys": sorted(cand), "finish": cand.get("finishReason"),
+             "groundingMetadata": bool(gm)}
+    if gm:
+        shape.update(gm_keys=sorted(gm), groundingChunks=len(gm.get("groundingChunks") or []),
+                     groundingSupports=len(gm.get("groundingSupports") or []),
+                     webSearchQueries=len(gm.get("webSearchQueries") or []))
+    return shape
 
 
 def answer_text(resp):
@@ -269,6 +282,9 @@ def run(rows, leads, args, api_key):
         print(f"[{i}/{len(rows)}] {row['business_name'][:40]:40} -> "
               f"{(r['first'] + ' ' + r['last']).replace('<UNKNOWN>', '').strip()[:28]:28} "
               f"({r['confidence']}) {r['grade']}  [{reason}; {len(g['queries'])} searches]")
+        if args.show_shape:
+            print(f"    shape: {response_shape(resp)} | tokens {usage.get('totalTokenCount', 0)} | est ${cost:.4f}")
+            print(f"    sources: {extra['source_urls'] or '(none)'} [{extra['source_titles']}]")
     return gated, raw
 
 
@@ -342,6 +358,8 @@ def main():
     ap.add_argument("--compare", metavar="CSV", help="compare a saved Gemini results CSV with the Brave A0 runs, no API calls")
     ap.add_argument("--brave", nargs="+", default=A0_RUNS, metavar="CSV", help="Brave-path results CSVs to compare against")
     ap.add_argument("--max-errors", type=int, default=3, help="stop after this many errors in a row")
+    ap.add_argument("--show-shape", action="store_true",
+                    help="per row, print which grounding fields the response carried, its sources and tokens")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
     args = ap.parse_args()
 
