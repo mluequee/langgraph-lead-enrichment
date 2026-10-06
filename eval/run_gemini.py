@@ -58,7 +58,8 @@ PRICES = {
 EST_COST_PER_ROW = 0.045   # list price incl. searches; smoke test: $0.043/row (token cost alone ~$0.01)
 A0_RUNS = ["eval/data/results_20261005_074654.csv", "eval/data/results_20261005_080444.csv"]
 EXTRA = ["goes_by", "title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
-         "search_queries", "raw_first", "raw_last", "tokens"]
+         "search_queries", "raw_first", "raw_last", "tokens",
+         "finish_reason", "block_reason", "prompt_tokens", "tooluse_tokens", "thought_tokens", "output_tokens"]
 NULLISH = {"", "null", "none", "n/a", "na", "unknown", "<unknown>"}
 
 PROMPT = """You are researching a local business to find its owner.
@@ -145,6 +146,17 @@ def response_shape(resp):
                      groundingSupports=len(gm.get("groundingSupports") or []),
                      webSearchQueries=len(gm.get("webSearchQueries") or []))
     return shape
+
+
+def diagnostics(resp):
+    """Why a response looks the way it does: finish reason, any prompt block, and the token split
+    (thinking tokens are billed and counted against the output budget). No content, only counts."""
+    cand = (resp.get("candidates") or [{}])[0]
+    u = resp.get("usageMetadata") or {}
+    return {"finish_reason": cand.get("finishReason") or ("NO_CANDIDATES" if not resp.get("candidates") else ""),
+            "block_reason": (resp.get("promptFeedback") or {}).get("blockReason", ""),
+            "prompt_tokens": u.get("promptTokenCount", 0), "tooluse_tokens": u.get("toolUsePromptTokenCount", 0),
+            "thought_tokens": u.get("thoughtsTokenCount", 0), "output_tokens": u.get("candidatesTokenCount", 0)}
 
 
 def answer_text(resp):
@@ -273,6 +285,8 @@ def run(rows, leads, args, api_key):
                  "supported": ok, "gate_reason": reason, "search_queries": " | ".join(g["queries"]),
                  "raw_first": (ans or {}).get("first") or "", "raw_last": (ans or {}).get("last") or "",
                  "tokens": usage.get("totalTokenCount", 0)}
+        diag = diagnostics(resp)
+        extra.update(diag)
         why = prose or text
         a_first, a_last = (ans or {}).get("first"), (ans or {}).get("last")
         gated.append(make_rec(row, ans, a_first if ok else None, a_last if ok else None,
@@ -285,6 +299,7 @@ def run(rows, leads, args, api_key):
         if args.show_shape:
             print(f"    shape: {response_shape(resp)} | tokens {usage.get('totalTokenCount', 0)} | est ${cost:.4f}")
             print(f"    sources: {extra['source_urls'] or '(none)'} [{extra['source_titles']}]")
+            print(f"    diag: {diag} | response keys {sorted(resp)}")
     return gated, raw
 
 
@@ -360,6 +375,7 @@ def main():
     ap.add_argument("--max-errors", type=int, default=3, help="stop after this many errors in a row")
     ap.add_argument("--show-shape", action="store_true",
                     help="per row, print which grounding fields the response carried, its sources and tokens")
+    ap.add_argument("--only", nargs="+", metavar="NAME", help="only rows whose business name contains one of these (case-insensitive)")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
     args = ap.parse_args()
 
@@ -389,6 +405,8 @@ def main():
             print(f"INTAKE SKIP: {lead['business_name']}")
             continue
         rows.append(r)
+    if args.only:
+        rows = [r for r in rows if any(o.lower() in r["business_name"].lower() for o in args.only)]
     if args.limit:
         rows = rows[:args.limit]
 
