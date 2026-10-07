@@ -1,4 +1,4 @@
-from typing import TypedDict, Literal, Annotated
+from typing import TypedDict, Literal, Annotated, Optional
 from langgraph.graph import END, StateGraph
 from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
@@ -23,6 +23,9 @@ if sys.platform == 'win32':
 from datetime import datetime
 
 import intake
+import evidence
+import export
+import setup_database
 
 py_logging.getLogger("anthropic").setLevel(py_logging.WARNING)
 py_logging.getLogger("langchain").setLevel(py_logging.WARNING)
@@ -57,8 +60,11 @@ class LeadCost:
     brave_calls: int = 0
     haiku_errors: list = None
     sonnet_errors: list = None
+    brave_errors: list = None
     
     def __post_init__(self):
+        if self.brave_errors is None:
+            self.brave_errors = []
         if self.haiku_errors is None:
             self.haiku_errors = []
         if self.sonnet_errors is None:
@@ -84,6 +90,10 @@ class LeadDatabase:
 
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
+        if os.path.exists(db_path):
+            added = setup_database.migrate_results(db_path)     # stage A columns; no-op once present
+            if added:
+                logging.getLogger(__name__).info(f"Migrated results table: added {', '.join(added)}")
 
     def get_all_leads(self) -> list[Lead]:
         """Fetch all unprocessed leads."""
@@ -118,8 +128,10 @@ class LeadDatabase:
             INSERT INTO results (
                 lead_id, decision_maker_first_name, decision_maker_last_name,
                 title, instagram, tiktok, facebook, linkedin, confidence, 
-                why_this_person, about_page_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                why_this_person, about_page_text,
+                goes_by_name, evidence_url, evidence_domain, evidence_source, evidence_url_kind,
+                other_evidence_urls, source_tier, delivered_confidence, status, error_detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             lead_id,
             result.get('decision_maker_first_name'),  # FIXED: was 'decision_make_first_name'
@@ -131,7 +143,17 @@ class LeadDatabase:
             result.get('linkedin'),
             result.get('confidence'),
             result.get('why_this_person'),
-            result.get('about_page_text', '')
+            result.get('about_page_text', ''),
+            result.get('goes_by_name'),
+            result.get('evidence_url'),
+            result.get('evidence_domain'),
+            result.get('evidence_source'),
+            result.get('evidence_url_kind'),
+            result.get('other_evidence_urls'),
+            result.get('source_tier'),
+            result.get('delivered_confidence'),
+            result.get('status'),
+            result.get('error_detail'),
         ))
 
         conn.commit()
@@ -213,34 +235,55 @@ class LeadState(TypedDict):
     queries: list[str]
     search_results: Annotated[list[dict], operator.add]
     combined_source_text: str
-    decision_maker_first_name: str
-    decision_maker_last_name: str
-    title: str
-    linkedin: str
-    instagram: str
-    tiktok: str
-    facebook: str
+    # Stage A: None is the one "nothing found" value for every name, title and social field.
+    decision_maker_first_name: Optional[str]
+    decision_maker_last_name: Optional[str]
+    goes_by_name: Optional[str]
+    title: Optional[str]
+    linkedin: Optional[str]
+    instagram: Optional[str]
+    tiktok: Optional[str]
+    facebook: Optional[str]
     confidence: Literal["high", "medium", "low"]
     why_this_person: str
     verified_confidence: Literal["high", "medium", "low"]
-    alternative_first_name: str
-    alternative_last_name: str
+    alternative_first_name: Optional[str]
+    alternative_last_name: Optional[str]
     verification_reasoning: str
     about_page_text: str
+    about_page_url: Optional[str]
+    # Stage A: record-keeping only. Nothing reads source_tier for confidence, routing or delivery.
+    evidence_url: Optional[str]
+    evidence_domain: Optional[str]
+    evidence_source: Optional[str]
+    evidence_url_kind: Optional[str]
+    other_evidence_urls: Optional[str]
+    source_tier: Optional[str]
+    delivered_confidence: Optional[str]
+    status: str
+    error_detail: Optional[str]
     # Phase 7: Cost tracking
     cost: LeadCost
 
 structured_model = extract_model.with_structured_output(OwnerResult, include_raw=True)
 
 # Phase 10: one encoding for "no name" everywhere (was <UNKNOWN>, <E>, <ERROR>, UNKNOWN, empty).
-NO_NAME = {"", "<UNKNOWN>", "<E>", "<ERROR>", "UNKNOWN", "N/A", "NA", "NONE"}
+NO_NAME = evidence.NO_NAME
 
 def _is_no_name(s: str)-> bool:
-    return (s or "").strip().upper() in NO_NAME
+    return evidence.is_none_like(s)
 
-def _clean_name(s: str) -> str:
-    """Canonical 'no name' is <UNKNOWN>. Stops 'Greg UNKNOWN' leaking into results."""
-    return "<UNKNOWN>" if _is_no_name(s) else s.strip()
+def _clean_name(s: str):
+    """Stage A: the one 'nothing found' value is None (was <UNKNOWN>, <ERROR>, '' and the
+    model's own 'Unknown'/'N/A'). Stops 'Greg UNKNOWN' leaking into results."""
+    return evidence.none_if_empty(s)
+
+def _prompt_name(state, name):
+    """How a missing name is shown INSIDE a prompt. Byte-identical to before stage A:
+    '<UNKNOWN>' normally, '<ERROR>' when the Haiku extraction itself raised."""
+    if not _is_no_name(name):
+        return name
+    return "<ERROR>" if state["cost"].haiku_errors else "<UNKNOWN>"
 # Phase 8: Identity anchor - location gate + about-page targeting
 
 US_STATES = {
@@ -458,20 +501,26 @@ def prep_lead(state: LeadState) -> dict:
         "queries": [],
         "search_results": [],
         "combined_source_text": "",
-        "decision_maker_first_name": "<UNKNOWN>",
-        "decision_maker_last_name": "<UNKNOWN>",
-        "title": "<UNKNOWN>",
-        "linkedin": "<UNKNOWN>",
-        "instagram": "<UNKNOWN>",
-        "tiktok": "<UNKNOWN>",
-        "facebook": "<UNKNOWN>",
+        "decision_maker_first_name": None,
+        "decision_maker_last_name": None,
+        "goes_by_name": None,
+        "title": None,
+        "linkedin": None,
+        "instagram": None,
+        "tiktok": None,
+        "facebook": None,
         "confidence": "low",
         "why_this_person": "",
         "verified_confidence": "low",
-        "alternative_first_name": "",
-        "alternative_last_name": "",
+        "alternative_first_name": None,
+        "alternative_last_name": None,
         "verification_reasoning": "",
         "about_page_text": "",
+        "about_page_url": None,
+        **evidence.empty_evidence(),
+        "delivered_confidence": None,
+        "status": "ok",
+        "error_detail": None,
         "cost": cost
     }
 
@@ -544,15 +593,18 @@ def _brave_search(state: LeadState, query_index: int) -> dict:
         logger.debug(f"Q{query_index + 1} returned {len(results)} results, {len(locations)} location(s)")
     except requests.exceptions.Timeout:
         logger.warning(f"Q{query_index + 1} timeout: {query}")
+        cost.brave_errors.append(f"Q{query_index + 1} timeout")
         cost.brave_calls += 1  # Count the retry
         results = []
         locations = []
     except requests.exceptions.HTTPError as e:
         logger.warning(f"Q{query_index + 1} HTTP error ({response.status_code}): {e}")
+        cost.brave_errors.append(f"Q{query_index + 1} HTTP {response.status_code}")
         results = []
         locations = []
     except Exception as e:
         logger.warning(f"Q{query_index + 1} failed: {type(e).__name__}: {e}")
+        cost.brave_errors.append(f"Q{query_index + 1} {type(e).__name__}")
         results = []
         locations = []
 
@@ -702,6 +754,20 @@ def _source_block_for_url(url: str, combined_text: str) -> str:
                 return block
     return ""
 
+def _canonical_url(url: str, combined_text: str):
+    """The URL exactly as the matching source block prints it (the citation gate compares lowercased)."""
+    block = _source_block_for_url(url, combined_text)
+    for line in block.splitlines():
+        if line.lower().startswith("url:"):
+            return line[4:].strip()
+    return None
+
+def _same_person(state, first, last) -> bool:
+    """Is (first, last) the person already in state? Decides whether title/socials still apply."""
+    norm = lambda s: (s or "").strip().lower()
+    return (norm(first), norm(last)) == (norm(state.get("decision_maker_first_name")),
+                                         norm(state.get("decision_maker_last_name")))
+
 def _evidence_supports_name(first: str, last: str, snippet: str, url: str, combined_text: str, business_name: str) -> tuple[bool, str]:
     """Phase 9: an extraction is only as good as its citation. The model's own
     transcription of the snippet is untrusted - it doesn't reliably quote
@@ -838,15 +904,17 @@ Return JSON with confidence: high (name + clear title), medium (name but unclear
                 f"- {evidence_reason} | snippet={response.evidence_snippet!r} | url={response.evidence_url!r}"
             )
             return {
-                "decision_maker_first_name": "<UNKNOWN>",
-                "decision_maker_last_name": "<UNKNOWN>",
-                "title": "",
-                "linkedin": "",
-                "instagram": "",
-                "tiktok": "",
-                "facebook": "",
+                "decision_maker_first_name": None,
+                "decision_maker_last_name": None,
+                "title": None,
+                "linkedin": None,
+                "instagram": None,
+                "tiktok": None,
+                "facebook": None,
                 "confidence": "low",
                 "why_this_person": "No verbatim evidence for extracted name.",
+                **evidence.empty_evidence(),
+                "delivered_confidence": None,
                 "cost": cost
             }
             
@@ -861,33 +929,41 @@ Return JSON with confidence: high (name + clear title), medium (name but unclear
         if calib_reason != "ok":
             logger.debug(f"Calibration: {calib_reason}")
 
+        first = _clean_name(response.decision_maker_first_name)
+        last = _clean_name(response.decision_maker_last_name)
+        ev_url = _canonical_url(response.evidence_url, combined_text) if (first or last) else None
         return {
-            "decision_maker_first_name": _clean_name(response.decision_maker_first_name),
-            "decision_maker_last_name": _clean_name(response.decision_maker_last_name),
-            "title": response.title,
-            "linkedin": response.linkedin,
-            "instagram": response.instagram,
-            "tiktok": response.tiktok,
-            "facebook": response.facebook,
+            "decision_maker_first_name": first,
+            "decision_maker_last_name": last,
+            "title": evidence.none_if_empty(response.title),
+            "linkedin": evidence.none_if_empty(response.linkedin),
+            "instagram": evidence.none_if_empty(response.instagram),
+            "tiktok": evidence.none_if_empty(response.tiktok),
+            "facebook": evidence.none_if_empty(response.facebook),
             "confidence": final_confidence,
             "why_this_person": response.why_this_person,
+            **evidence.evidence_fields(ev_url, evidence.SRC_BRAVE, own_website=state.get("website", "")),
+            "delivered_confidence": final_confidence if (first or last) else None,
             "cost": cost
         }
     except Exception as e:
         logger.error(f"Haiku extraction failed: {type(e).__name__}: {e}")
         cost.haiku_errors.append(f"Extraction error: {str(e)}")
         
-        # Fallback to low confidence
+        # Fallback to low confidence. The failure lives in cost.haiku_errors (-> status 'error'
+        # if nothing else delivers a name), no longer in a '<ERROR>' name.
         return {
-            "decision_maker_first_name": "<ERROR>",
-            "decision_maker_last_name": "<ERROR>",
-            "title": "",
-            "linkedin": "",
-            "instagram": "",
-            "tiktok": "",
-            "facebook": "",
+            "decision_maker_first_name": None,
+            "decision_maker_last_name": None,
+            "title": None,
+            "linkedin": None,
+            "instagram": None,
+            "tiktok": None,
+            "facebook": None,
             "confidence": "low",
             "why_this_person": f"Extraction failed: {str(e)}",
+            **evidence.empty_evidence(),
+            "delivered_confidence": None,
             "cost": cost
         }
 
@@ -902,13 +978,13 @@ def verify_owner(state: LeadState) -> dict:
 
     prompt = f"""You are an expert at verifying business decision-maker identification.
 
-Haiku's extraction: {haiku_first} {haiku_last}
+Haiku's extraction: {_prompt_name(state, haiku_first)} {_prompt_name(state, haiku_last)}
 
 Search results:
 {combined_text}
 
 Your task:
-1. Does the text strongly support {haiku_first} {haiku_last} as primary owner/founder?
+1. Does the text strongly support {_prompt_name(state, haiku_first)} {_prompt_name(state, haiku_last)} as primary owner/founder?
 2. If NOT, find an ALTERNATIVE owner in the results. 
 
 Return JSON:
@@ -971,21 +1047,36 @@ Return JSON:
             )
             return {
                 "verified_confidence": "low",
-                "decision_maker_first_name": "<UNKNOWN>",
-                "decision_maker_last_name": "<UNKNOWN>",
-                "alternative_first_name": "",
-                "alternative_last_name": "",
+                "decision_maker_first_name": None,
+                "decision_maker_last_name": None,
+                "alternative_first_name": None,
+                "alternative_last_name": None,
                 "verification_reasoning": "No verbatim evidence for verified name.",
+                "title": None,
+                "linkedin": None,
+                "instagram": None,
+                "tiktok": None,
+                "facebook": None,
+                **evidence.empty_evidence(),
+                "delivered_confidence": None,
                 "cost": cost
             }
 
+        v_first = _clean_name(verification["verified_first_name"])
+        v_last = _clean_name(verification["verified_last_name"])
+        has_name = bool(v_first or v_last)
+        same = _same_person(state, v_first, v_last)       # Haiku's title/socials only apply to the same person
+        ev_url = _canonical_url(verification.get("verified_evidence_url", ""), combined_text) if has_name else None
         return {
             "verified_confidence": verification["verified_confidence"],
-            "decision_maker_first_name": _clean_name(verification["verified_first_name"]),
-            "decision_maker_last_name": _clean_name(verification["verified_last_name"]),
-            "alternative_first_name": verification["alternative_first_name"],
-            "alternative_last_name": verification["alternative_last_name"],
+            "decision_maker_first_name": v_first,
+            "decision_maker_last_name": v_last,
+            "alternative_first_name": evidence.none_if_empty(verification["alternative_first_name"]),
+            "alternative_last_name": evidence.none_if_empty(verification["alternative_last_name"]),
             "verification_reasoning": verification["verification_reasoning"],
+            **({} if same else {"title": None, "linkedin": None, "instagram": None, "tiktok": None, "facebook": None}),
+            **evidence.evidence_fields(ev_url, evidence.SRC_BRAVE, own_website=state.get("website", "")),
+            "delivered_confidence": verification["verified_confidence"] if has_name else None,
             "cost": cost
         }
     except Exception as e:
@@ -1044,7 +1135,7 @@ def fetch_about_page(state: LeadState) -> dict:
 
     if not domain_source:
         logger.debug("No usable owned domain for About-page fetch (blank or booking platform)")
-        return {"about_page_text": ""}
+        return {"about_page_text": "", "about_page_url": None}
 
     # Parse domain
     try:
@@ -1054,11 +1145,12 @@ def fetch_about_page(state: LeadState) -> dict:
         domain = f"{parsed.scheme}://{parsed.netloc}"
     except Exception:
         logger.debug(f"Failed to parse domain from {domain_source}")
-        return {"about_page_text": ""}
+        return {"about_page_text": "", "about_page_url": None}
 
     # Try about-page variants
     about_paths = ["/about", "/about-us", "/team", "/about-page"]
     about_text = ""
+    fetched_url = None
 
     for path in about_paths:
         try:
@@ -1066,6 +1158,7 @@ def fetch_about_page(state: LeadState) -> dict:
             response = requests.get(about_url, timeout=5)
             if response.status_code == 200:
                 about_text = response.text
+                fetched_url = about_url
                 logger.debug(f"Fetched {about_url}")
                 break
         except Exception:
@@ -1082,7 +1175,7 @@ def fetch_about_page(state: LeadState) -> dict:
         about_text = '. '.join(filtered[:3])[:8000]
     
     logger.debug(f"About-page text: {len(about_text)} chars")
-    return {"about_page_text": about_text, "cost": cost}
+    return {"about_page_text": about_text, "about_page_url": fetched_url, "cost": cost}
 
 def extract_owner_from_about(state: LeadState) -> dict:
     """Second-pass extraction from About page using Haiku.
@@ -1129,16 +1222,34 @@ Return JSON with confidence: high/medium/low."""
         if not evidence_ok:
             logger.debug(f"About-page evidence check failed for {response.decision_maker_first_name} {response.decision_maker_last_name} - {evidence_reason}")
             return {
-                "decision_maker_first_name": "<UNKNOWN>",
-                "decision_maker_last_name": "<UNKNOWN>",
+                "decision_maker_first_name": None,
+                "decision_maker_last_name": None,
                 "confidence": "low",
+                "title": None,
+                "linkedin": None,
+                "instagram": None,
+                "tiktok": None,
+                "facebook": None,
+                **evidence.empty_evidence(),
+                "delivered_confidence": None,
                 "cost": cost
             }
         
+        a_first = _clean_name(response.decision_maker_first_name)
+        a_last = _clean_name(response.decision_maker_last_name)
+        has_name = bool(a_first or a_last)
+        about_url = state.get("about_page_url") if has_name else None
         return {
-            "decision_maker_first_name": _clean_name(response.decision_maker_first_name),
-            "decision_maker_last_name": _clean_name(response.decision_maker_last_name),
+            "decision_maker_first_name": a_first,
+            "decision_maker_last_name": a_last,
             "confidence": response.confidence,
+            "title": evidence.none_if_empty(response.title),
+            "linkedin": evidence.none_if_empty(response.linkedin),
+            "instagram": evidence.none_if_empty(response.instagram),
+            "tiktok": evidence.none_if_empty(response.tiktok),
+            "facebook": evidence.none_if_empty(response.facebook),
+            **evidence.evidence_fields(about_url, evidence.SRC_ABOUT, own_website=about_url or ""),
+            "delivered_confidence": response.confidence if has_name else None,
             "cost": cost
         }
     except Exception as e:
@@ -1150,9 +1261,29 @@ def flag_for_review(state: LeadState) -> dict:
     """Phase 9: no evidence -> blank. Only low-confidence leads reach this node,
     so any name still in state is unverified and must not be delivered."""
     logger.info("→ No owner found, flagged for manual review")
-    return {"decision_maker_first_name": "<UNKNOWN>",
-            "decision_maker_last_name": "<UNKNOWN>",
-            "title": ""}
+    return {"decision_maker_first_name": None,
+            "decision_maker_last_name": None,
+            "title": None,
+            "linkedin": None,
+            "instagram": None,
+            "tiktok": None,
+            "facebook": None,
+            **evidence.empty_evidence(),
+            "delivered_confidence": None}
+
+def finalize(state: LeadState) -> dict:
+    """Last node on every path. Stage A, record-keeping only: sets status ('ok' or 'error') and its
+    detail, and makes sure a blank carries no evidence or confidence. It never changes a name."""
+    has_name = bool(state.get("decision_maker_first_name") or state.get("decision_maker_last_name"))
+    cost = state["cost"]
+    status, detail = evidence.compute_status(
+        has_name, brave_errors=len(cost.brave_errors), n_queries=len(state.get("queries") or []),
+        haiku_errors=len(cost.haiku_errors), sonnet_errors=len(cost.sonnet_errors))
+    out = {"status": status, "error_detail": detail}
+    if not has_name:
+        out.update(evidence.empty_evidence())
+        out["delivered_confidence"] = None
+    return out
 
 def route_after_about(state: LeadState) -> str:
     confidence = state["confidence"]
@@ -1179,6 +1310,7 @@ graph.add_node("verify_owner", verify_owner)
 graph.add_node("fetch_about_page", fetch_about_page)
 graph.add_node("extract_owner_from_about", extract_owner_from_about)
 graph.add_node("flag_for_review", flag_for_review)
+graph.add_node("finalize", finalize)
 
 graph.set_entry_point("prep_lead")
 graph.add_edge("prep_lead", "build_queries")
@@ -1199,7 +1331,7 @@ graph.add_conditional_edges(
     route_after_search,
     {
         "verify_owner": "verify_owner",
-        "end": END
+        "end": "finalize"
     }
 )
 
@@ -1208,7 +1340,7 @@ graph.add_conditional_edges(
     route_after_verification,
     {
         "fetch_about_page": "fetch_about_page",
-        "end": END
+        "end": "finalize"
     }
 )
 graph.add_edge("fetch_about_page", "extract_owner_from_about")
@@ -1218,9 +1350,11 @@ graph.add_conditional_edges(
     route_after_about,
     {
         "flag_for_review": "flag_for_review",
-        "end": END
+        "end": "finalize"
     }
 )
+graph.add_edge("flag_for_review", "finalize")
+graph.add_edge("finalize", END)
 
 app = graph.compile()
 
@@ -1391,7 +1525,7 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
 
             results_summary.append({
                 'business_name': lead.business_name,
-                'langgraph_owner': f"{first_name} {last_name}",
+                'langgraph_owner': f"{first_name or ''} {last_name or ''}".strip(),
                 'langgraph_confidence': confidence,
                 'n8n_owner': f"{n8n_baseline.get('first', '')} {n8n_baseline.get('last', '')}".strip(),
                 'n8n_confidence': n8n_baseline.get('confidence', ''),
@@ -1404,6 +1538,11 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
         except Exception as e:
             logger.error(f"✗ Error processing {lead.business_name}: {e}")
             accuracy_metrics['langgraph_errors'] += 1
+            try:     # a crashed lead is an error row, not a missing one, so the export shows it
+                db.write_result(lead.id, {"status": "error",
+                                          "error_detail": f"graph crashed: {type(e).__name__}: {e}"[:300]})
+            except Exception as db_err:
+                logger.error(f"Could not record the crash for {lead.business_name}: {db_err}")
             results_summary.append({
                 'business_name': lead.business_name,
                 'langgraph_owner': 'ERROR',
@@ -1455,6 +1594,13 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
         logger.info(f"Detailed comparison saved to: {comparison_file}\n")
     except Exception as e:
         logger.error(f"Failed to write comparison file: {e}\n")
+
+    # Stage A: the enriched CSV (one row per lead, errors apart from blanks, skips listed)
+    try:
+        out_path, counts = export.write_export(db.db_path)
+        logger.info(f"Enriched export written to {out_path}: {counts}\n")
+    except Exception as e:
+        logger.error(f"Export failed: {e}\n")
 
     # Sample output
     logger.info("Sample results (first 10):")

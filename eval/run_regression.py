@@ -40,7 +40,10 @@ BASELINE = ("PRE-A0 baseline (unmodified code, 2026-09-25, 2 runs, 47 audit rows
             "lenient 18/42, 17/42 | strict 12/42, 13/42 | correct blanks 0/4. History only: the filtered set has its own "
             "baseline (stage A0). Noise ~1-2 correct.")
 FIELDS = ["id", "business_name", "subset", "first", "last", "confidence",
-          "verified_confidence", "grade", "truth", "why_this_person", "cost_usd", "seconds", "error"]
+          "verified_confidence", "grade", "truth", "why_this_person", "cost_usd", "seconds", "error",
+          # stage A: evidence and status (record-keeping; the grade never reads source_tier)
+          "goes_by_name", "delivered_confidence", "source_tier", "evidence_url", "evidence_url_kind",
+          "evidence_domain", "evidence_source", "other_evidence_urls", "status"]
 
 
 def key(name):
@@ -137,16 +140,23 @@ def run_pipeline(rows, verbose):
         try:
             res = first_graph.app.invoke(graph_input(lead))
             cost = res.get("cost")
-            rec.update(first=res.get("decision_maker_first_name", ""),
-                       last=res.get("decision_maker_last_name", ""),
+            rec.update(first=res.get("decision_maker_first_name") or "",    # None (nothing found) -> empty cell
+                       last=res.get("decision_maker_last_name") or "",
                        confidence=res.get("confidence", ""),
                        verified_confidence=res.get("verified_confidence", ""),
                        why_this_person=(res.get("why_this_person") or "")[:300],
-                       cost_usd=round(cost.estimated_cost_usd(), 4) if cost else 0.0)
-            rec["grade"] = judge(rec["first"], rec["last"], row)
+                       cost_usd=round(cost.estimated_cost_usd(), 4) if cost else 0.0,
+                       status=res.get("status") or "ok")
+            for k in ("goes_by_name", "delivered_confidence", "source_tier", "evidence_url", "evidence_url_kind",
+                      "evidence_domain", "evidence_source", "other_evidence_urls"):
+                rec[k] = res.get(k) or ""
+            if rec["status"] == "error":                  # a failed lead is an error, never a blank
+                rec.update(grade="error", error=(res.get("error_detail") or "status error")[:300])
+            else:
+                rec["grade"] = judge(rec["first"], rec["last"], row)
         except Exception as e:                            # the eval must finish even if a lead fails
             rec.update(first="", last="", confidence="", verified_confidence="",
-                       why_this_person="", cost_usd=0.0, grade="error", error=str(e)[:300])
+                       why_this_person="", cost_usd=0.0, grade="error", error=str(e)[:300], status="error")
         rec["seconds"] = round(time.time() - t0, 1)
         out.append(rec)
         print(f"[{i}/{len(found)}] {rec['business_name'][:40]:40} -> "
@@ -179,6 +189,12 @@ def report(recs):
             print(fmt(summarize(grades), f"{subset:7}"))
     if any(r["subset"] == "audit" for r in recs):
         print(BASELINE)
+
+    if recs and "evidence_url" in recs[0]:            # stage A gate: every named lead carries an evidence URL
+        named = [r for r in recs if r["grade"] in ("full", "partial", "wrong")]
+        missing = [r for r in named if not r.get("evidence_url")]
+        print(f"Named rows without an evidence URL: {len(missing)} of {len(named)}"
+              + ("" if not missing else " -> " + ", ".join(r["business_name"] for r in missing)))
 
     errors = [r for r in recs if r["grade"] == "error"]
     if errors:

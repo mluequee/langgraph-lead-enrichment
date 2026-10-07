@@ -5,6 +5,35 @@ import csv
 
 DB_PATH = "leads.db"
 
+# Stage A: evidence, tier and status columns on `results`. Added to old databases by
+# migrate_results (ALTER TABLE ADD COLUMN, safe to repeat). Existing rows keep NULL in them.
+RESULTS_NEW_COLUMNS = [
+    ("goes_by_name", "TEXT"), ("evidence_url", "TEXT"), ("evidence_domain", "TEXT"),
+    ("evidence_source", "TEXT"), ("evidence_url_kind", "TEXT"), ("other_evidence_urls", "TEXT"),
+    ("source_tier", "TEXT"), ("delivered_confidence", "TEXT"), ("status", "TEXT"), ("error_detail", "TEXT"),
+]
+
+
+def migrate_results(db_path: str) -> list:
+    """Add any missing stage-A columns to `results`. Returns the names it added (empty if none).
+
+    Never drops or rewrites data. Back the database up first (the first migration of leads.db
+    was preceded by a copy, leads_pre_stage_a_backup.db)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(results)")}
+        if not have:
+            return []                       # no results table yet; init_database creates it with the columns
+        added = []
+        for name, ctype in RESULTS_NEW_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE results ADD COLUMN {name} {ctype}")
+                added.append(name)
+        conn.commit()
+        return added
+    finally:
+        conn.close()
+
 
 def parse_city_state(address: str) -> tuple[str, str]:
     """Parse 'street, city, ST zip, USA' into (city, state). Returns ('', '') if it doesn't fit."""
@@ -63,7 +92,17 @@ def init_database(reset: bool = False):
             confidence TEXT,
             why_this_person TEXT,
             about_page_text TEXT,
-            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            goes_by_name TEXT,
+            evidence_url TEXT,
+            evidence_domain TEXT,
+            evidence_source TEXT,
+            evidence_url_kind TEXT,
+            other_evidence_urls TEXT,
+            source_tier TEXT,
+            delivered_confidence TEXT,
+            status TEXT,
+            error_detail TEXT
         )
     """)
 

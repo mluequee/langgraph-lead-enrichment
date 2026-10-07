@@ -44,6 +44,7 @@ from scoring import judge, summarize, norm_tokens, match_person, is_blank  # noq
 from run_regression import (GT, DB, FIELDS, key, select, excluded_rows,   # noqa: E402
                             print_excluded, truth_text, rescore)
 import intake                                                              # noqa: E402
+import evidence                                                            # noqa: E402
 
 load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
@@ -57,7 +58,7 @@ PRICES = {
 }
 EST_COST_PER_ROW = 0.045   # list price incl. searches; smoke test: $0.043/row (token cost alone ~$0.01)
 A0_RUNS = ["eval/data/results_20261005_074654.csv", "eval/data/results_20261005_080444.csv"]
-EXTRA = ["goes_by", "title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
+EXTRA = ["title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
          "search_queries", "raw_first", "raw_last", "tokens",
          "finish_reason", "block_reason", "prompt_tokens", "tooluse_tokens", "thought_tokens", "output_tokens",
          "status", "retries"]
@@ -320,7 +321,14 @@ def run(rows, leads, args, api_key, retry_log=None):
             ok, sources, reason = False, [], "answer had no parseable JSON"
         else:
             ok, sources, reason = gate(ans, g)
-        extra = {"goes_by": (ans or {}).get("goes_by") or "", "title": (ans or {}).get("title") or "",
+        first_src = sources[0] if sources else None
+        extra = {"goes_by_name": (ans or {}).get("goes_by") or "", "title": (ans or {}).get("title") or "",
+                 # stage A evidence columns. Google redirect links are recorded as returned (kind 'redirect',
+                 # NOT resolved); the domain is the grounding chunk's title. Label only.
+                 **{k: (v or "") for k, v in (evidence.evidence_fields(
+                     first_src["uri"], evidence.SRC_GEMINI, domain=first_src["title"],
+                     other_urls=[s["uri"] for s in sources[1:]]) if first_src else evidence.empty_evidence()).items()},
+                 "delivered_confidence": (ans or {}).get("confidence") if ok else "",
                  "source_urls": " | ".join(s["uri"] for s in sources),
                  "source_titles": " | ".join(s["title"] for s in sources),
                  "model_urls": " | ".join((ans or {}).get("model_urls", [])),
@@ -351,7 +359,7 @@ def errors_with_retry(errors):
 
 def write_csv(path, recs):
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS + EXTRA, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=FIELDS + [c for c in EXTRA if c not in FIELDS], extrasaction="ignore")
         w.writeheader()
         w.writerows(recs)
 
