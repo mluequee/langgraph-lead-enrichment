@@ -48,125 +48,17 @@ import evidence                                                            # noq
 
 load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
-DEFAULT_MODEL = "gemini-3.8-flash"
-ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-# USD per 1M tokens (input, output incl. thinking), and per search. LIST price, an upper bound:
-# the 5,000 free searches/month are not subtracted. 3.8 Flash token prices double on 2027-01-01.
-PRICES = {
-    "gemini-3.8-flash": {"in": 0.75, "out": 3.75, "search": 14 / 1000},   # billed per search query run
-    "gemini-2.5-flash": {"in": 0.30, "out": 2.50, "search": 35 / 1000},   # billed per grounded prompt
-}
+# The prompt, parsing, grounding reader and cost estimate live in gemini_path.py (the pipeline's Gemini path)
+# and are imported here UNCHANGED, so the experiment script and the pipeline can never drift apart.
+from gemini_path import (MODEL as DEFAULT_MODEL, ENDPOINT, PRICES, NULLISH, PROMPT, build_prompt, _nullish,   # noqa: E402,F401
+                         parse_answer, extract_grounding, response_shape, diagnostics, answer_text, is_empty,
+                         estimate_cost)
 EST_COST_PER_ROW = 0.045   # list price incl. searches; smoke test: $0.043/row (token cost alone ~$0.01)
 A0_RUNS = ["eval/data/results_20261005_074654.csv", "eval/data/results_20261005_080444.csv"]
 EXTRA = ["title", "source_urls", "source_titles", "model_urls", "supported", "gate_reason",
          "search_queries", "raw_first", "raw_last", "tokens",
          "finish_reason", "block_reason", "prompt_tokens", "tooluse_tokens", "thought_tokens", "output_tokens",
          "status", "retries"]
-NULLISH = {"", "null", "none", "n/a", "na", "unknown", "<unknown>"}
-
-PROMPT = """You are researching a local business to find its owner.
-
-Business: {business_name}
-Address: {address}
-City and state: {city}, {state}
-Phone: {phone}
-
-Use Google Search. Rules:
-- Find the owner (or founder or co-founder) of THIS business at THIS address. Businesses elsewhere with the same or a similar name are NOT this business: check the city, address or phone before you rely on a source.
-- Only name a person that a source explicitly says owns, founded or runs this business. Never infer a name from the business name.
-- Report one person, the primary owner. If you cannot find one with a source, say so. A blank is better than a guess.
-
-Answer in two parts.
-1. Two or three plain sentences saying who the owner is and which source says so (name the site).
-2. On the final line, one JSON object and nothing after it:
-{{"owner_first_name": string or null, "owner_last_name": string or null, "goes_by_name": string or null, "title": string or null, "confidence": "high" or "medium" or "low", "source_urls": [string]}}
-Use null where unknown. Use confidence "high" only when a source explicitly names this person as the owner of this business."""
-
-
-def build_prompt(lead):
-    """Name, address, city, state, phone. The website is deliberately not sent."""
-    v = lambda x: x or "(not provided)"
-    return PROMPT.format(business_name=lead["business_name"], address=v(lead["address"]),
-                         city=v(lead["city"]), state=v(lead["state"]), phone=v(lead["phone"]))
-
-
-def _nullish(s):
-    return s is None or str(s).strip().lower() in NULLISH
-
-
-def parse_answer(text):
-    """Pull the final JSON object out of Gemini's text. Returns (dict, prose) or (None, text).
-
-    Scans from the last '{' backwards for an object that parses and carries the expected key,
-    so braces in the prose cannot confuse it."""
-    dec = json.JSONDecoder()
-    for m in reversed([m.start() for m in re.finditer(r"\{", text or "")]):
-        try:
-            obj, _ = dec.raw_decode(text[m:])
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and "owner_first_name" in obj:
-            clean = lambda k: None if _nullish(obj.get(k)) else str(obj[k]).strip()
-            conf = str(obj.get("confidence", "low")).strip().lower()
-            urls = obj.get("source_urls") if isinstance(obj.get("source_urls"), list) else []
-            return {"first": clean("owner_first_name"), "last": clean("owner_last_name"),
-                    "goes_by": clean("goes_by_name"), "title": clean("title"),
-                    "confidence": conf if conf in ("high", "medium", "low") else "low",
-                    "model_urls": [str(u) for u in urls]}, text[:m].strip()
-    return None, (text or "").strip()
-
-
-def extract_grounding(resp):
-    """Read groundingMetadata off the first candidate. Tolerates it being absent.
-
-    Fields (REST, camelCase): webSearchQueries[], groundingChunks[].web.{uri,title},
-    groundingSupports[].{segment.text, groundingChunkIndices[]}. A support's segment is a span of
-    the MODEL'S answer, and its indices point at the chunks (sources) backing that span."""
-    cand = (resp.get("candidates") or [{}])[0]
-    gm = cand.get("groundingMetadata")
-    out = {"present": bool(gm), "queries": [], "chunks": [], "supports": []}
-    if not gm:
-        return out
-    out["queries"] = list(gm.get("webSearchQueries") or [])
-    for c in gm.get("groundingChunks") or []:
-        web = c.get("web") or {}
-        out["chunks"].append({"uri": web.get("uri", ""), "title": web.get("title", "")})
-    for s in gm.get("groundingSupports") or []:
-        out["supports"].append({"text": (s.get("segment") or {}).get("text", ""),
-                                "indices": list(s.get("groundingChunkIndices") or [])})
-    return out
-
-
-def response_shape(resp):
-    """Which grounding fields the response actually carried (counts and key names only, no content)."""
-    cand = (resp.get("candidates") or [{}])[0]
-    gm = cand.get("groundingMetadata")
-    shape = {"candidate_keys": sorted(cand), "finish": cand.get("finishReason"),
-             "groundingMetadata": bool(gm)}
-    if gm:
-        shape.update(gm_keys=sorted(gm), groundingChunks=len(gm.get("groundingChunks") or []),
-                     groundingSupports=len(gm.get("groundingSupports") or []),
-                     webSearchQueries=len(gm.get("webSearchQueries") or []))
-    return shape
-
-
-def diagnostics(resp):
-    """Why a response looks the way it does: finish reason, any prompt block, and the token split
-    (thinking tokens are billed and counted against the output budget). No content, only counts."""
-    cand = (resp.get("candidates") or [{}])[0]
-    u = resp.get("usageMetadata") or {}
-    return {"finish_reason": cand.get("finishReason") or ("NO_CANDIDATES" if not resp.get("candidates") else ""),
-            "block_reason": (resp.get("promptFeedback") or {}).get("blockReason", ""),
-            "prompt_tokens": u.get("promptTokenCount", 0), "tooluse_tokens": u.get("toolUsePromptTokenCount", 0),
-            "thought_tokens": u.get("thoughtsTokenCount", 0), "output_tokens": u.get("candidatesTokenCount", 0)}
-
-
-def answer_text(resp):
-    cand = (resp.get("candidates") or [{}])[0]
-    parts = (cand.get("content") or {}).get("parts") or []
-    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
-
-
 def gate(answer, grounding):
     """Deliver a name only if a grounded segment of Gemini's answer contains it.
 
@@ -195,16 +87,6 @@ def gate(answer, grounding):
     return True, sources, "ok"
 
 
-def estimate_cost(model, usage, n_queries):
-    p = PRICES.get(model)
-    if not p:
-        return 0.0
-    tin = (usage.get("promptTokenCount", 0) or 0) + (usage.get("toolUsePromptTokenCount", 0) or 0)
-    tout = (usage.get("candidatesTokenCount", 0) or 0) + (usage.get("thoughtsTokenCount", 0) or 0)
-    searches = n_queries if model.startswith("gemini-3") else (1 if n_queries else 0)
-    return (tin * p["in"] + tout * p["out"]) / 1_000_000 + searches * p["search"]
-
-
 def call_gemini(prompt, model, api_key):
     """One grounded generateContent call. Returns (json, error). The key goes in a header, never in a URL."""
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
@@ -227,11 +109,6 @@ def call_gemini(prompt, model, api_key):
         if r.status_code not in (429, 500, 502, 503, 504):
             break
     return None, last
-
-
-def is_empty(resp):
-    """No answer text at all: no candidates, no parts, or only thought parts."""
-    return not answer_text(resp).strip()
 
 
 def ask_with_retry(prompt, model, api_key, name, call=None, log=print):

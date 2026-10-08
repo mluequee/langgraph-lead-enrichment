@@ -11,6 +11,11 @@ RESULTS_NEW_COLUMNS = [
     ("goes_by_name", "TEXT"), ("evidence_url", "TEXT"), ("evidence_domain", "TEXT"),
     ("evidence_source", "TEXT"), ("evidence_url_kind", "TEXT"), ("other_evidence_urls", "TEXT"),
     ("source_tier", "TEXT"), ("delivered_confidence", "TEXT"), ("status", "TEXT"), ("error_detail", "TEXT"),
+    # stage C2: reconcile outcome, each path's own answer, and the Gemini path's status
+    ("reconcile_case", "TEXT"), ("review_candidates", "TEXT"), ("brave_first_name", "TEXT"), ("brave_last_name", "TEXT"),
+    ("gemini_first_name", "TEXT"), ("gemini_last_name", "TEXT"), ("gemini_goes_by_name", "TEXT"), ("gemini_title", "TEXT"),
+    ("gemini_confidence", "TEXT"), ("gemini_status", "TEXT"), ("gemini_error", "TEXT"), ("gemini_evidence_url", "TEXT"),
+    ("gemini_seconds", "REAL"), ("gemini_cost_usd", "REAL"),
 ]
 
 
@@ -102,7 +107,21 @@ def init_database(reset: bool = False):
             source_tier TEXT,
             delivered_confidence TEXT,
             status TEXT,
-            error_detail TEXT
+            error_detail TEXT,
+            reconcile_case TEXT,
+            review_candidates TEXT,
+            brave_first_name TEXT,
+            brave_last_name TEXT,
+            gemini_first_name TEXT,
+            gemini_last_name TEXT,
+            gemini_goes_by_name TEXT,
+            gemini_title TEXT,
+            gemini_confidence TEXT,
+            gemini_status TEXT,
+            gemini_error TEXT,
+            gemini_evidence_url TEXT,
+            gemini_seconds REAL,
+            gemini_cost_usd REAL
         )
     """)
 

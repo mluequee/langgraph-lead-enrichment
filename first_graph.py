@@ -24,6 +24,10 @@ from datetime import datetime
 
 import intake
 import evidence
+import gemini_path
+import reconcile
+import time
+from concurrent.futures import ThreadPoolExecutor
 import export
 import setup_database
 
@@ -35,6 +39,13 @@ for _noisy in ("httpx", "httpcore", "urllib3"):
 load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
+
+# Stage C2: Gemini is the second path. GEMINI_ENABLED False skips it (the Brave answer is then delivered unchanged).
+GEMINI_ENABLED = True
+GEMINI_MODEL = gemini_path.MODEL
+# Leads processed at the same time. Each lead fires up to 5 Brave searches at once, so N workers put at most
+# 5*N requests in flight; Brave allows 50 per second (x-ratelimit-policy 50;w=1).
+DEFAULT_WORKERS = 4
 
 @dataclass
 class Lead:
@@ -61,6 +72,8 @@ class LeadCost:
     haiku_errors: list = None
     sonnet_errors: list = None
     brave_errors: list = None
+    brave_429: int = 0                  # recording only: Brave 429 responses seen
+    brave_429_recovered: int = 0        # of those, the retry came back without a 429
     
     def __post_init__(self):
         if self.brave_errors is None:
@@ -130,8 +143,11 @@ class LeadDatabase:
                 title, instagram, tiktok, facebook, linkedin, confidence, 
                 why_this_person, about_page_text,
                 goes_by_name, evidence_url, evidence_domain, evidence_source, evidence_url_kind,
-                other_evidence_urls, source_tier, delivered_confidence, status, error_detail
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                other_evidence_urls, source_tier, delivered_confidence, status, error_detail,
+                reconcile_case, review_candidates, brave_first_name, brave_last_name,
+                gemini_first_name, gemini_last_name, gemini_goes_by_name, gemini_title, gemini_confidence,
+                gemini_status, gemini_error, gemini_evidence_url, gemini_seconds, gemini_cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             lead_id,
             result.get('decision_maker_first_name'),  # FIXED: was 'decision_make_first_name'
@@ -154,6 +170,20 @@ class LeadDatabase:
             result.get('delivered_confidence'),
             result.get('status'),
             result.get('error_detail'),
+            result.get('reconcile_case'),
+            result.get('review_candidates'),
+            (result.get('brave_answer') or {}).get('first'),
+            (result.get('brave_answer') or {}).get('last'),
+            (result.get('gemini') or {}).get('first'),
+            (result.get('gemini') or {}).get('last'),
+            (result.get('gemini') or {}).get('goes_by'),
+            (result.get('gemini') or {}).get('title'),
+            (result.get('gemini') or {}).get('confidence'),
+            (result.get('gemini') or {}).get('status'),
+            (result.get('gemini') or {}).get('error'),
+            ((result.get('gemini') or {}).get('evidence') or {}).get('evidence_url'),
+            (result.get('gemini') or {}).get('seconds'),
+            (result.get('gemini') or {}).get('cost_usd'),
         ))
 
         conn.commit()
@@ -262,6 +292,11 @@ class LeadState(TypedDict):
     delivered_confidence: Optional[str]
     status: str
     error_detail: Optional[str]
+    # Stage C2: the Gemini path's own answer, the Brave answer as it stood before reconcile, and the outcome
+    gemini: Optional[dict]
+    brave_answer: Optional[dict]
+    reconcile_case: Optional[str]
+    review_candidates: Optional[str]
     # Phase 7: Cost tracking
     cost: LeadCost
 
@@ -521,6 +556,10 @@ def prep_lead(state: LeadState) -> dict:
         "delivered_confidence": None,
         "status": "ok",
         "error_detail": None,
+        "gemini": None,
+        "brave_answer": None,
+        "reconcile_case": None,
+        "review_candidates": None,
         "cost": cost
     }
 
@@ -577,6 +616,19 @@ def _brave_search(state: LeadState, query_index: int) -> dict:
 
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 429:           # rate limited: wait the stated time (max 5 s), try once more
+            try:
+                wait = float((response.headers.get('Retry-After') or response.headers.get('X-RateLimit-Reset') or '1')
+                             .split(',')[0])
+            except ValueError:
+                wait = 1.0
+            cost.brave_429 += 1
+            logger.warning(f"Q{query_index + 1} rate limited (429), retrying once in {min(wait, 5):.0f}s")
+            time.sleep(min(max(wait, 0.5), 5))
+            cost.brave_calls += 1
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            if response.status_code != 429:
+                cost.brave_429_recovered += 1
         response.raise_for_status()
         data = response.json()
         results = data.get("web", {}).get("results", [])
@@ -1271,14 +1323,60 @@ def flag_for_review(state: LeadState) -> dict:
             **evidence.empty_evidence(),
             "delivered_confidence": None}
 
+def gemini_search(state: LeadState) -> dict:
+    """Second path (stage C2). Runs next to the Brave branch and writes ONLY the 'gemini' key. It never raises: a
+    timeout, an empty response or any failure is status 'error', and reconcile then keeps the Brave answer."""
+    if not GEMINI_ENABLED:
+        return {"gemini": {"status": "disabled", "error": None}}
+    lead = {k: state.get(k) or "" for k in ("business_name", "address", "city", "state", "phone", "website")}
+    try:
+        res = gemini_path.ask_gemini(lead, os.getenv("GEMINI_API_KEY"), model=GEMINI_MODEL)
+    except Exception as e:                      # belt and braces; ask_gemini is written not to raise
+        res = {"status": "error", "error": f"{type(e).__name__}: {e}"[:200], "cost_usd": 0.0, "seconds": 0.0}
+    logger.debug(f"Gemini for {lead['business_name']}: {res.get('status')} {res.get('error') or ''}")
+    return {"gemini": res}
+
+_EVIDENCE_KEYS = ("evidence_url", "evidence_domain", "evidence_source", "evidence_url_kind", "source_tier",
+                  "other_evidence_urls")
+
+def reconcile_node(state: LeadState) -> dict:
+    """Join of the two paths (stage C2, option 5; rules in reconcile.py). Waits for the Brave branch AND Gemini."""
+    first, last = state.get("decision_maker_first_name"), state.get("decision_maker_last_name")
+    brave = None
+    if first or last:
+        brave = {"first": first, "last": last, "title": state.get("title"),
+                 "confidence": state.get("delivered_confidence") or state.get("confidence"),
+                 "evidence": {k: state.get(k) for k in _EVIDENCE_KEYS}}
+    out = {"brave_answer": {"first": first, "last": last, "title": state.get("title"),
+                            "confidence": state.get("delivered_confidence") or state.get("confidence"),
+                            "evidence_url": state.get("evidence_url")}}
+    res = reconcile.reconcile(brave, state.get("gemini"))
+    out["reconcile_case"] = res["case"]
+    out["review_candidates"] = json.dumps(res["candidates"]) if res["candidates"] else None
+    if res["keep_brave"]:
+        return out                                   # Gemini unavailable: the Brave answer stands, untouched
+    if res["deliver"]:
+        same_as_brave = brave is not None and (res["first"], res["last"]) == (first, last)
+        out.update({"decision_maker_first_name": res["first"], "decision_maker_last_name": res["last"],
+                    "title": res["title"], "delivered_confidence": res["confidence"], "goes_by_name": res["goes_by"],
+                    **res["evidence"]})
+        if not same_as_brave:                        # Brave's socials belong to Brave's candidate
+            out.update({"linkedin": None, "instagram": None, "tiktok": None, "facebook": None})
+    else:
+        out.update({"decision_maker_first_name": None, "decision_maker_last_name": None, "title": None,
+                    "linkedin": None, "instagram": None, "tiktok": None, "facebook": None,
+                    "goes_by_name": None, "delivered_confidence": None, **evidence.empty_evidence()})
+    return out
+
 def finalize(state: LeadState) -> dict:
     """Last node on every path. Stage A, record-keeping only: sets status ('ok' or 'error') and its
     detail, and makes sure a blank carries no evidence or confidence. It never changes a name."""
     has_name = bool(state.get("decision_maker_first_name") or state.get("decision_maker_last_name"))
     cost = state["cost"]
+    g_ok = (state.get("gemini") or {}).get("status") == "ok"      # a Gemini that completed makes a blank credible
     status, detail = evidence.compute_status(
-        has_name, brave_errors=len(cost.brave_errors), n_queries=len(state.get("queries") or []),
-        haiku_errors=len(cost.haiku_errors), sonnet_errors=len(cost.sonnet_errors))
+        has_name, brave_errors=0 if g_ok else len(cost.brave_errors), n_queries=len(state.get("queries") or []),
+        haiku_errors=0 if g_ok else len(cost.haiku_errors), sonnet_errors=0 if g_ok else len(cost.sonnet_errors))
     out = {"status": status, "error_detail": detail}
     if not has_name:
         out.update(evidence.empty_evidence())
@@ -1311,9 +1409,14 @@ graph.add_node("fetch_about_page", fetch_about_page)
 graph.add_node("extract_owner_from_about", extract_owner_from_about)
 graph.add_node("flag_for_review", flag_for_review)
 graph.add_node("finalize", finalize)
+graph.add_node("gemini_search", gemini_search)
+# defer=True: reconcile waits until EVERY other pending task is done. The Brave branch has many steps, the Gemini
+# branch one; without it reconcile would fire as soon as Gemini returns and then again when Brave ends.
+graph.add_node("reconcile", reconcile_node, defer=True)
 
 graph.set_entry_point("prep_lead")
 graph.add_edge("prep_lead", "build_queries")
+graph.add_edge("prep_lead", "gemini_search")
 graph.add_edge("build_queries", "search_q1")
 graph.add_edge("build_queries", "search_q2")
 graph.add_edge("build_queries", "search_q3")
@@ -1331,7 +1434,7 @@ graph.add_conditional_edges(
     route_after_search,
     {
         "verify_owner": "verify_owner",
-        "end": "finalize"
+        "end": "reconcile"
     }
 )
 
@@ -1340,7 +1443,7 @@ graph.add_conditional_edges(
     route_after_verification,
     {
         "fetch_about_page": "fetch_about_page",
-        "end": "finalize"
+        "end": "reconcile"
     }
 )
 graph.add_edge("fetch_about_page", "extract_owner_from_about")
@@ -1350,10 +1453,12 @@ graph.add_conditional_edges(
     route_after_about,
     {
         "flag_for_review": "flag_for_review",
-        "end": "finalize"
+        "end": "reconcile"
     }
 )
-graph.add_edge("flag_for_review", "finalize")
+graph.add_edge("flag_for_review", "reconcile")
+graph.add_edge("gemini_search", "reconcile")
+graph.add_edge("reconcile", "finalize")
 graph.add_edge("finalize", END)
 
 app = graph.compile()
@@ -1454,9 +1559,32 @@ class AccuracyComparison:
                 'notes': f'LG: {lg_first} {lg_last} ({lg_conf}) vs n8n: {n8n_first} {n8n_last} ({n8n_conf})'}
 
 
-def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte_Barbershops__7_.csv"):
+def _invoke_lead(lead):
+    """Run the graph for one lead. Returns (result, error); never raises, so one bad lead cannot stop a batch."""
+    try:
+        return app.invoke({
+            "business_name": lead.business_name,
+            "lead_id": lead.id,
+            "website": lead.website,
+            "address": lead.address,
+            "phone": lead.phone,
+            "city": lead.city,
+            "state": lead.state,
+        }), None
+    except Exception as e:
+        return None, e
+
+def gemini_error_rate(results):
+    """(ok, error, rate) over the results whose Gemini path ran (disabled or missing results do not count)."""
+    st = [((r or {}).get("gemini") or {}).get("status") for r in results]
+    ok, err = st.count("ok"), st.count("error")
+    return ok, err, (err / (ok + err) if ok + err else 0.0)
+
+def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte_Barbershops__7_.csv",
+                        workers: int = DEFAULT_WORKERS):
     """Process multiple leads from database and compare to n8n baseline."""
     db = LeadDatabase()
+    gemini_path.reset()          # a 402 disables Gemini for ONE batch only
     leads, skipped = intake.filter_leads(db.get_all_leads(), log=logger)
     skipped_path = intake.write_skipped_file(skipped)
     logger.info(f"Skipped leads written to {skipped_path}")
@@ -1482,20 +1610,18 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
         'lg_only': 0
     }
 
-    for i, lead in enumerate(leads, 1):
+    # Leads run concurrently (the graph is thread-safe per call); database writes and the comparison stay on this thread.
+    batch_start = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        outcomes = list(pool.map(_invoke_lead, leads))
+    batch_seconds = time.time() - batch_start
+
+    for i, (lead, (result, run_error)) in enumerate(zip(leads, outcomes), 1):
         logger.info(f"\n[{i}/{len(leads)}] {lead.business_name}")
 
         try:
-            result = app.invoke({
-                "business_name": lead.business_name,
-                "lead_id": lead.id,
-                "website": lead.website,
-                "address": lead.address,
-                "phone": lead.phone,
-                "city": lead.city,
-                "state": lead.state,
-            })
-
+            if run_error is not None:
+                raise run_error
             db.write_result(lead.id, result)
 
             confidence = result.get('confidence', 'unknown')
@@ -1554,6 +1680,30 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
                 'brave_calls': 0,
                 'estimated_cost_usd': '$0.00'
             })
+
+    g_ok, g_err, g_rate = gemini_error_rate([r for r, _ in outcomes])
+    logger.info(f"Gemini path: {g_ok} ok, {g_err} error ({g_rate:.0%} error rate); {workers} workers, {batch_seconds:.0f}s")
+    _costs = [r["cost"] for r, _ in outcomes if r and r.get("cost")]
+    logger.info(f"Brave: {sum(c.brave_calls for c in _costs)} searches, {sum(c.brave_429 for c in _costs)} rate-limited (429), "
+                f"{sum(c.brave_429_recovered for c in _costs)} recovered on retry, {sum(len(c.brave_errors) for c in _costs)} searches errored")
+    try:     # stored per batch next to the per-lead gemini_status/gemini_error columns
+        stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_stats.csv")
+        new = not os.path.exists(stats_path)
+        with open(stats_path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["finished", "leads", "workers", "seconds", "gemini_ok", "gemini_error", "gemini_error_rate",
+                            "gemini_requests", "gemini_search_queries", "brave_searches", "brave_429", "brave_429_recovered",
+                            "brave_search_errors"])
+            costs = [r["cost"] for r, _ in outcomes if r and r.get("cost")]
+            gem = [(r or {}).get("gemini") or {} for r, _ in outcomes]
+            w.writerow([datetime.now().isoformat(timespec="seconds"), len(leads), workers, round(batch_seconds),
+                        g_ok, g_err, round(g_rate, 3), sum(g.get("attempts") or 0 for g in gem),
+                        sum(g.get("searches") or 0 for g in gem), sum(c.brave_calls for c in costs),
+                        sum(c.brave_429 for c in costs), sum(c.brave_429_recovered for c in costs),
+                        sum(len(c.brave_errors) for c in costs)])
+    except Exception as e:
+        logger.error(f"Could not write batch_stats.csv: {e}")
 
     # SUMMARY
     logger.info(f"\n{'='*80}")
