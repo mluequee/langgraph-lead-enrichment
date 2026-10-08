@@ -1,6 +1,6 @@
 """Stage C experiment: Gemini with Grounding with Google Search vs the Brave path.
 
-NOT wired into first_graph.py. For each audit row that survives the intake filter,
+NOT wired into src/graph.py. For each audit row that survives the intake filter,
 send Gemini the business name, address, city, state and phone (no website), let it
 search Google, and grade the answer with the same scorer as run_regression.py.
 
@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 EVAL = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(EVAL)
 sys.path.insert(0, EVAL)
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 from scoring import judge, summarize, norm_tokens, match_person, is_blank  # noqa: E402
 from run_regression import (GT, DB, FIELDS, key, select, excluded_rows,   # noqa: E402
                             print_excluded, truth_text, rescore)

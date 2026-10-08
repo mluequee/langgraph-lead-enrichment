@@ -10,7 +10,7 @@ import sys
 
 EVAL = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, EVAL)
-sys.path.insert(0, os.path.dirname(EVAL))
+sys.path.insert(0, os.path.join(os.path.dirname(EVAL), "src"))
 import intake                                             # noqa: E402
 from run_regression import excluded_rows, GT              # noqa: E402
 

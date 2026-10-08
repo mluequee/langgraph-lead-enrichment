@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, HERE)
 for k in ("ANTHROPIC_API_KEY", "BRAVE_API_KEY", "GEMINI_API_KEY"):
     os.environ[k] = "test-key-not-real"                 # load_dotenv never overrides these, so real keys are never used
@@ -295,7 +295,8 @@ check("the key is sent in a header, never in a URL", "key" not in gp.ENDPOINT)
 
 # --- The graph, offline: the join, the fallback, concurrency ---------------------------------------
 sys.stdout.flush()
-import first_graph as fg                                # noqa: E402
+import graph as fg                                # noqa: E402
+import run as run_mod                               # noqa: E402
 logging.disable(logging.CRITICAL)
 # Gemini is OFF by default (stage E0). These graph tests exercise the two-path join with a FAKE ask_gemini, so they
 # turn the node on; gemini_path's own network switch (allow_gemini) stays off and no real call can happen.
@@ -454,13 +455,13 @@ try:
                              city="Charlotte", state="NC") for i, n in enumerate(many)]
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=4) as pool:
-        outcomes = list(pool.map(fg._invoke_lead, leads))
+        outcomes = list(pool.map(run_mod._invoke_lead, leads))
 finally:
     fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key, fg.gemini_path.ask_gemini = saved_inv
 check("concurrency: 8 leads on 4 workers, each result belongs to its own lead, no errors",
       all(err is None for _, err in outcomes)
       and all(r["decision_maker_first_name"] == f"Owner{i}" and r["reconcile_case"] == "agree" for i, (r, _) in enumerate(outcomes)))
-ok, bad_, rate = fg.gemini_error_rate([r for r, _ in outcomes] + [{"gemini": {"status": "error"}}, {"gemini": {"status": "disabled"}}, None])
+ok, bad_, rate = run_mod.gemini_error_rate([r for r, _ in outcomes] + [{"gemini": {"status": "error"}}, {"gemini": {"status": "disabled"}}, None])
 check("Gemini error rate counts ok and error only (disabled and missing results are left out)", (ok, bad_) == (8, 1) and abs(rate - 1 / 9) < 1e-9)
 
 # Brave: one retry on a 429 (it used to become silently empty results)
