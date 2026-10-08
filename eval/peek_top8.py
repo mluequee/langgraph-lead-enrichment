@@ -4,8 +4,8 @@ from collections import Counter
 from urllib.parse import urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-import first_graph as fg
+sys.path.insert(0, os.path.join(ROOT, "src"))
+import graph as fg
 
 wanted = [n.lower() for n in sys.argv[1:]]
 for lead in fg.LeadDatabase().get_all_leads():

@@ -1,8 +1,8 @@
 """Offline test of the relevance gate, built from real strings in the Phase 10 peek."""
 import os, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-import first_graph as fg
+sys.path.insert(0, os.path.join(ROOT, "src"))
+import graph as fg
 
 LI = "https://linkedin.com/in/"
 CASES = [

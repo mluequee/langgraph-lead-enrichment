@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, HERE)
 # Dummy keys first: load_dotenv does not override variables that are already set, so this test can never
 # use (or even see) the real keys.
@@ -180,9 +180,9 @@ with tempfile.TemporaryDirectory() as d:
           not any(v in ("None", "<UNKNOWN>", "<ERROR>") for r in back for v in r.values()))
 
 # --- The graph, offline: fakes for Haiku, Sonnet and the web ------------------------------------
-sys.stdout.flush()                                       # first_graph swaps sys.stdout; keep the lines printed so far
+sys.stdout.flush()                                       # graph swaps sys.stdout; keep the lines printed so far
 import requests                                          # noqa: E402
-import first_graph as fg                                 # noqa: E402
+import graph as fg                                 # noqa: E402
 logging.disable(logging.CRITICAL)
 
 

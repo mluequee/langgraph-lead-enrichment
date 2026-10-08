@@ -1,7 +1,7 @@
 """Enriched CSV: one row per lead, with evidence, and blanks, errors and skips kept apart.
 
-    python export.py                       # leads.db -> enriched_leads.csv
-    python export.py --db other.db --out out.csv
+    python src/export.py                   # leads.db -> enriched_leads.csv
+    python src/export.py --db other.db --out out.csv
 
 Also called at the end of process_leads_batch. Every lead in the database appears exactly once, with
 its most recent result (the `results` table has no uniqueness rule, so re-runs are collapsed here).
@@ -27,10 +27,10 @@ import sqlite3
 
 import evidence
 import intake
+import paths
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DB = os.path.join(HERE, "leads.db")
-DEFAULT_OUT = os.path.join(HERE, "enriched_leads.csv")
+DEFAULT_DB = paths.DB_PATH
+DEFAULT_OUT = paths.EXPORT_PATH
 
 COLUMNS = [
     "place_id", "business_name", "address", "phone", "website",

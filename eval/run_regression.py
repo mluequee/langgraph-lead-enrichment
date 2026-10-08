@@ -31,7 +31,7 @@ from datetime import datetime
 EVAL = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(EVAL)
 sys.path.insert(0, EVAL)
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 from scoring import judge, summarize, fmt, norm_tokens  # noqa: E402
 import intake                                             # noqa: E402
 import c2_report                                          # noqa: E402
@@ -63,7 +63,7 @@ def key(name):
 def graph_input(lead):
     """What the graph receives for one lead.
 
-    MUST stay identical to the app.invoke call in first_graph.process_leads_batch,
+    MUST stay identical to the app.invoke call in graph.process_leads_batch,
     or this eval tests something production doesn't run.
     """
     return {
@@ -127,16 +127,16 @@ def select(rows, subset, limit):
 
 
 def run_pipeline(rows, verbose, workers=4, use_gemini=True):
-    sys.path.insert(0, ROOT)
-    import first_graph                                    # noqa: E402  (loads keys, builds graph)
-    first_graph.GEMINI_ENABLED = use_gemini
-    first_graph.gemini_path.allow_gemini(use_gemini)   # real calls only when the caller passed --gemini and confirmed
-    first_graph.gemini_path.reset()      # a 402 disables Gemini for this run only
+    sys.path.insert(0, os.path.join(ROOT, "src"))
+    import graph                                    # noqa: E402  (loads keys, builds graph)
+    graph.GEMINI_ENABLED = use_gemini
+    graph.gemini_path.allow_gemini(use_gemini)   # real calls only when the caller passed --gemini and confirmed
+    graph.gemini_path.reset()      # a 402 disables Gemini for this run only
     if not verbose:
-        logging.getLogger("first_graph").setLevel(logging.WARNING)
+        logging.getLogger("graph").setLevel(logging.WARNING)
         logging.getLogger("__main__").setLevel(logging.WARNING)
 
-    leads = {key(l.business_name): l for l in first_graph.LeadDatabase().get_all_leads()}
+    leads = {key(l.business_name): l for l in graph.LeadDatabase().get_all_leads()}
     found = [(r, leads.get(r["key"])) for r in rows]
     missing = [r["business_name"] for r, l in found if l is None]
     if missing:
@@ -153,7 +153,7 @@ def run_pipeline(rows, verbose, workers=4, use_gemini=True):
                "truth": truth_text(row), "error": ""}
         t0 = time.time()
         try:
-            res = first_graph.app.invoke(graph_input(lead))
+            res = graph.app.invoke(graph_input(lead))
             cost = res.get("cost")
             rec.update(first=res.get("decision_maker_first_name") or "",    # None (nothing found) -> empty cell
                        last=res.get("decision_maker_last_name") or "",

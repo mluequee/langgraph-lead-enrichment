@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, HERE)
 for k in ("ANTHROPIC_API_KEY", "BRAVE_API_KEY", "GEMINI_API_KEY"):
     os.environ[k] = "test-key-not-real"                 # load_dotenv never overrides these, so real keys are never used
@@ -295,7 +295,7 @@ check("the key is sent in a header, never in a URL", "key" not in gp.ENDPOINT)
 
 # --- The graph, offline: the join, the fallback, concurrency ---------------------------------------
 sys.stdout.flush()
-import first_graph as fg                                # noqa: E402
+import graph as fg                                # noqa: E402
 logging.disable(logging.CRITICAL)
 # Gemini is OFF by default (stage E0). These graph tests exercise the two-path join with a FAKE ask_gemini, so they
 # turn the node on; gemini_path's own network switch (allow_gemini) stays off and no real call can happen.

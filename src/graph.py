@@ -29,6 +29,7 @@ import reconcile
 import time
 from concurrent.futures import ThreadPoolExecutor
 import export
+import paths
 import setup_database
 
 py_logging.getLogger("anthropic").setLevel(py_logging.WARNING)
@@ -38,7 +39,7 @@ for _noisy in ("httpx", "httpcore", "urllib3"):
     py_logging.getLogger(_noisy).setLevel(py_logging.WARNING)
 load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
+DB_PATH = paths.DB_PATH
 
 # Stage C2: Gemini is the second path. Stage E0: it is OFF unless the run opts in with --gemini, which sets this
 # and gemini_path.allow_gemini(True). Off, the Brave answer is delivered unchanged and the row records gemini_status=off.
@@ -1688,7 +1689,7 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
     logger.info(f"Brave: {sum(c.brave_calls for c in _costs)} searches, {sum(c.brave_429 for c in _costs)} rate-limited (429), "
                 f"{sum(c.brave_429_recovered for c in _costs)} recovered on retry, {sum(len(c.brave_errors) for c in _costs)} searches errored")
     try:     # stored per batch next to the per-lead gemini_status/gemini_error columns
-        stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batch_stats.csv")
+        stats_path = paths.BATCH_STATS_PATH
         new = not os.path.exists(stats_path)
         with open(stats_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
