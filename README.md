@@ -124,9 +124,10 @@ cp .env.example .env
 
 ### Run a Batch
 ```bash
-python setup_database.py  # Initialize leads.db
-python first_graph.py     # Process all leads
-# Output: langgraph_debug.log (DEBUG), console (INFO), phase7_accuracy_comparison_TIMESTAMP.csv
+python src/setup_database.py  # Initialize leads.db
+python src/run.py             # Process all leads (Gemini is off; --gemini opts in and costs money)
+# Output: langgraph_debug.log (DEBUG), console (INFO), enriched_leads.csv, skipped_leads.csv
+python eval/compare_n8n.py    # Optional: compare leads.db with the n8n baseline CSV (free, writes phase7_accuracy_comparison_TIMESTAMP.csv)
 ```
 
 ---
