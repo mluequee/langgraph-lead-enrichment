@@ -60,23 +60,6 @@ def key(name):
     return " ".join(t for t in norm_tokens(name) if not t.isdigit())
 
 
-def graph_input(lead):
-    """What the graph receives for one lead.
-
-    MUST stay identical to the app.invoke call in graph.process_leads_batch,
-    or this eval tests something production doesn't run.
-    """
-    return {
-        "business_name": lead.business_name,
-        "lead_id": lead.id,
-        "website": lead.website,
-        "address": lead.address,
-        "phone": lead.phone,
-        "city": lead.city,
-        "state": lead.state,
-    }
-
-
 def excluded_rows(rows):
     """Ground-truth rows the intake filter would skip: {row id: reason}.
 
@@ -129,6 +112,7 @@ def select(rows, subset, limit):
 def run_pipeline(rows, verbose, workers=4, use_gemini=True):
     sys.path.insert(0, os.path.join(ROOT, "src"))
     import graph                                    # noqa: E402  (loads keys, builds graph)
+    import run as run_mod                           # noqa: E402  (lead_to_input: the one place the graph input is built)
     graph.GEMINI_ENABLED = use_gemini
     graph.gemini_path.allow_gemini(use_gemini)   # real calls only when the caller passed --gemini and confirmed
     graph.gemini_path.reset()      # a 402 disables Gemini for this run only
@@ -153,7 +137,7 @@ def run_pipeline(rows, verbose, workers=4, use_gemini=True):
                "truth": truth_text(row), "error": ""}
         t0 = time.time()
         try:
-            res = graph.app.invoke(graph_input(lead))
+            res = graph.app.invoke(run_mod.lead_to_input(lead))
             cost = res.get("cost")
             rec.update(first=res.get("decision_maker_first_name") or "",    # None (nothing found) -> empty cell
                        last=res.get("decision_maker_last_name") or "",
