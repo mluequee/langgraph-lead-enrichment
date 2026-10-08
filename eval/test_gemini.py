@@ -173,5 +173,18 @@ check("CSV keeps the two cases apart (status ok/blank vs error, with a retries c
       back["Blank Shop"]["status"] == "ok" and back["Empty Twice Shop"]["status"] == "error"
       and back["Empty Twice Shop"]["error"] and not back["Blank Shop"]["error"] and back["Recovered Shop"]["retries"] == "1")
 
+# --- Stage E0: the harness's own network call is guarded by --gemini ------------------------------------------
+import requests                                            # noqa: E402
+_posts = []
+_real_post = requests.post
+requests.post = lambda *a, **k: _posts.append(1)
+try:
+    r_off = rg.call_gemini("p", "m", "k")
+    check("call_gemini without --gemini: error, requests.post never reached", r_off[0] is None and "off" in r_off[1] and _posts == [])
+finally:
+    requests.post = _real_post
+_src = open(rg.__file__, encoding="utf-8").read()
+check("run_gemini main() refuses to run without --gemini", "Pass --gemini to allow it" in _src and "confirm_opt_in" in _src)
+
 print("\nGemini harness tests passed." if not failures else f"\n{len(failures)} FAILED: {failures}")
 sys.exit(1 if failures else 0)

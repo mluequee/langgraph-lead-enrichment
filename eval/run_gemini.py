@@ -50,6 +50,7 @@ load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
 # The prompt, parsing, grounding reader and cost estimate live in gemini_path.py (the pipeline's Gemini path)
 # and are imported here UNCHANGED, so the experiment script and the pipeline can never drift apart.
+import gemini_path                                                         # noqa: E402
 from gemini_path import (MODEL as DEFAULT_MODEL, ENDPOINT, PRICES, NULLISH, PROMPT, build_prompt, _nullish,   # noqa: E402,F401
                          parse_answer, extract_grounding, response_shape, diagnostics, answer_text, is_empty,
                          estimate_cost)
@@ -93,6 +94,8 @@ def call_gemini(prompt, model, api_key):
     last = ""
     for attempt, wait in enumerate((0, 3, 9)):
         time.sleep(wait)
+        if not gemini_path.is_allowed():            # last line of defence: no network access without --gemini
+            return None, "Gemini is off: pass --gemini to allow calls"
         try:
             r = requests.post(ENDPOINT.format(model=model), json=body, timeout=120,
                               headers={"x-goog-api-key": api_key, "Content-Type": "application/json"})
@@ -312,6 +315,8 @@ def main():
                     help="per row, print which grounding fields the response carried, its sources and tokens")
     ap.add_argument("--only", nargs="+", metavar="NAME", help="only rows whose business name contains one of these (case-insensitive)")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
+    ap.add_argument("--gemini", action="store_true", help="REQUIRED to call Gemini (this script's only purpose; costs money)")
+    ap.add_argument("--no-gemini", action="store_true", help="accepted for compatibility; has no effect")
     args = ap.parse_args()
 
     with open(GT, encoding="utf-8") as f:
@@ -322,6 +327,8 @@ def main():
         compare(args.compare, args.brave, gt, excluded)
         return
 
+    if not args.gemini:
+        raise SystemExit("This script calls Gemini. Pass --gemini to allow it. Nothing was spent.")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise SystemExit("GEMINI_API_KEY is not set (add it to the secrets file the repo loads).")
@@ -348,7 +355,7 @@ def main():
     print(f"\nAbout to ask {args.model} (Grounding with Google Search) about {len(rows)} shop(s). "
           f"Estimated ~${len(rows) * EST_COST_PER_ROW:.2f} at list price (tokens plus $14 per 1,000 searches; "
           f"the first 5,000 searches a month are free on a paid tier).")
-    if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
+    if not gemini_path.confirm_opt_in(len(rows), args.yes):
         raise SystemExit("Cancelled. Nothing was spent.")
 
     retry_log = []

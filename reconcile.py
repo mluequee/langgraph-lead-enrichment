@@ -3,6 +3,7 @@
 Pure Python, no API calls. Confidence labels and source_tier never decide anything here.
 
     Gemini unavailable (error / disabled)  -> the Brave answer, unchanged (a Gemini failure never costs an answer)
+    Gemini off (run without --gemini)      -> the Brave answer, unchanged; recorded as case gemini_off
     both blank                             -> blank
     both name the same person              -> deliver the fuller name, confidence high (medium if no surname),
                                               Brave's direct URL as evidence when Brave's name is delivered,
@@ -22,8 +23,8 @@ import unicodedata
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 FUZZY = 0.85        # tolerates a spelling slip such as Vancannon / Voncannon
 
-AGREE, BRAVE_ONLY, GEMINI_ONLY, CONFLICT, BOTH_BLANK, UNAVAILABLE = (
-    "agree", "brave_only", "gemini_only", "conflict", "both_blank", "gemini_unavailable")
+AGREE, BRAVE_ONLY, GEMINI_ONLY, CONFLICT, BOTH_BLANK, UNAVAILABLE, GEMINI_OFF = (
+    "agree", "brave_only", "gemini_only", "conflict", "both_blank", "gemini_unavailable", "gemini_off")
 
 
 def _tokens(text):
@@ -98,7 +99,9 @@ def reconcile(brave, gemini):
     out = {"case": None, "deliver": False, "first": None, "last": None, "title": None, "confidence": None,
            "goes_by": None, "evidence": _blank_ev(), "candidates": [], "keep_brave": False}
     if (gemini or {}).get("status") != "ok":
-        out.update(case=UNAVAILABLE, keep_brave=True, deliver=bool(brave))
+        # 'off' = the run did not opt in to Gemini (a choice); anything else = Gemini was tried and failed
+        case = GEMINI_OFF if (gemini or {}).get("status") == "off" else UNAVAILABLE
+        out.update(case=case, keep_brave=True, deliver=bool(brave))
         return out
     if not brave and not g:
         out["case"] = BOTH_BLANK

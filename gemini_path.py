@@ -36,6 +36,32 @@ RETRYABLE_HTTP = (429, 500, 502, 503, 504)
 _disabled = {"reason": None}
 _disable_lock = threading.Lock()
 
+# Spend safeguard (stage E0): Gemini costs money, so nothing may call it unless the run opted in with --gemini.
+# Only a command line flag turns this on; tests never do, because they inject their own `call`.
+_allow = {"on": False}
+
+
+def allow_gemini(on=True):
+    """Opt in (or out) of real Gemini network calls for this process. Called only by the --gemini flags."""
+    _allow["on"] = bool(on)
+
+
+def is_allowed():
+    return _allow["on"]
+
+
+COST_NOTE = "~$0.45/lead observed Oct 7, cause unconfirmed"
+
+
+def confirm_opt_in(n_leads, assume_yes=False, input_fn=input):
+    """Shown by every --gemini flag. Returns True (and switches real calls on) only on an explicit 'y'."""
+    print(f"--gemini: this run WILL call Gemini for {n_leads} lead(s): {COST_NOTE} "
+          f"(about ${n_leads * 0.45:.2f}; spend cap $38, $37.39 used).")
+    if not assume_yes and input_fn("Allow Gemini calls for this run? [y/N] ").strip().lower() != "y":
+        return False
+    allow_gemini(True)
+    return True
+
 
 def reset():
     """Re-enable Gemini. Call at the start of a batch or run."""
@@ -232,6 +258,8 @@ def resolve_redirect(url, timeout=5):
 def call_once(prompt, model, api_key, timeout):
     """One grounded generateContent call. Returns (resp, error, retryable). Key in a header, never a URL."""
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
+    if not _allow["on"]:                       # the last line of defence: no network access without --gemini
+        return None, "Gemini is off: pass --gemini to allow calls", False
     try:
         r = requests.post(ENDPOINT.format(model=model), json=body, timeout=(10, max(timeout, 1)),
                           headers={"x-goog-api-key": api_key, "Content-Type": "application/json"})
@@ -259,11 +287,13 @@ def _failed(error, attempts, seconds, cost, status="error"):
 
 def ask_gemini(lead, api_key, model=MODEL, per_attempt=PER_ATTEMPT_S, total=TOTAL_S, call=None, clock=None):
     """The whole Gemini path for one lead. Never raises. Returns a dict:
-    status 'ok' | 'error', error, first, last, goes_by, title, confidence, evidence (stage A fields),
+    status 'ok' | 'error' | 'disabled' (402 earlier in the batch) | 'off' (no --gemini), error, first, last, goes_by, title, confidence, evidence (stage A fields),
     support ('segment' | 'response' | 'none'), searches, cost_usd, seconds, attempts.
 
     At most two attempts, and the second only if at least MIN_RETRY_S of the TOTAL_S budget is left.
     A timeout, HTTP 429/5xx or an empty response is retried once; other HTTP errors are not."""
+    if call is None and not _allow["on"]:
+        return _failed("Gemini is off: pass --gemini to allow calls", 0, 0.0, 0.0, status="off")
     call, clock = call or call_once, clock or time.monotonic
     if not api_key:
         return _failed("GEMINI_API_KEY is not set", 0, 0.0, 0.0)

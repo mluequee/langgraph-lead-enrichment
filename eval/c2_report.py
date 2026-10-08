@@ -27,7 +27,7 @@ def _blank_rows(recs):
 def alone_grades(recs, which):
     """Grades for 'brave' or 'gemini' alone; Gemini rows without an answer are dropped (counted by the caller)."""
     col = f"{which}_grade"
-    return [r[col] for r in recs if r["grade"] != "excluded" and r.get(col) not in (None, "", "error", "disabled")]
+    return [r[col] for r in recs if r["grade"] != "excluded" and r.get(col) not in (None, "", "error", "disabled", "off")]
 
 
 def candidates(rec):
@@ -90,12 +90,34 @@ def gemini_rule(g_err, g_off, g_run, rate):
             f"(classes: {cls}{', DISABLED rows present (402)' if g_off else ''})")
 
 
+def report_gemini_off(recs, scored):
+    """A run made without --gemini (every row gemini_status=off): Brave only, the C2 gate does not apply."""
+    n_owner, n_blank = len(_owner_rows(recs)), len(_blank_rows(recs))
+    print("\nGemini off by choice, C2 gate not applicable (the Brave answer was delivered on every row).")
+    sb = _line("Brave alone (delivered)", [r["grade"] for r in scored if r["grade"] != "error"], n_owner, n_blank)
+    named = [r for r in scored if r["grade"] in NAMED]
+    no_ev = [r for r in named if not r.get("evidence_url")]
+    n_err = sum(r.get("status") == "error" for r in scored)
+    requests_made = sum(int(float(r.get("gemini_attempts") or 0)) for r in recs)
+    print("\nChecks that still apply:")
+    for text, ok in (
+            (f"delivered wrong names <= 3: {sb['wrong']}", sb["wrong"] <= 3),
+            (f"correct blanks >= 2 of {n_blank}: {sb['correct_blanks']}", sb["correct_blanks"] >= min(2, n_blank)),
+            (f"named rows without an evidence URL: {len(no_ev)} of {len(named)}", not no_ev),
+            (f"leads with status=error: {n_err}", n_err == 0),
+            (f"Gemini requests made: {requests_made}", requests_made == 0)):
+        print(f"  {'PASS' if ok else 'FAIL'}  {text}")
+    print("  n/a   Gemini alone, combined vs Brave, reachable, Gemini error rate")
+
+
 def report(recs, gt_by_id, holdout=False):
     """Three-way table, reachable, gate. recs need the stage C2 columns (brave_grade, gemini_grade, ...)."""
     if not recs or not any("brave_grade" in r for r in recs):
         return
     n_owner, n_blank = len(_owner_rows(recs)), len(_blank_rows(recs))
     scored = [r for r in recs if r["grade"] not in ("excluded",)]
+    if scored and all(r.get("gemini_status") == "off" for r in scored):
+        return report_gemini_off(recs, scored)
     g_err = [r for r in scored if r.get("gemini_status") == "error"]
     g_run = [r for r in scored if r.get("gemini_status") in ("ok", "error")]
     print("\nSame run, three views (correct counts out of the owner-bearing rows):")
@@ -183,6 +205,8 @@ def diff_vs(recs, ref_recs, label):
         if diffs:
             rows.append((r, o, diffs))
     print(f"\nRows that differ from {label} ({len(rows)}):")
+    if rows:
+        print("  names: " + "; ".join(r["business_name"] for r, _, _ in rows))
     for r, o, diffs in rows:
         print(f"  {r['business_name'][:30]:30} | ref {_answer(o)[:18]:18} [{o['grade']}] | now {_answer(r)[:18]:18} [{r['grade']}]"
               f" ({r.get('reconcile_case') or '-'}) | {', '.join(diffs)}")

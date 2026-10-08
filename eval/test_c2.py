@@ -129,6 +129,40 @@ requests.get = raises
 check("a failed resolution keeps the link and never raises", gp.resolve_redirect(REDIR) == (REDIR, "redirect"))
 requests.get = boom
 
+# --- Stage E0: the opt-in safeguard -------------------------------------------------------------------------------
+check("allow switch is off by default", gp.is_allowed() is False)
+posts = []
+E0_LEAD = {k: "x" for k in ("business_name", "address", "city", "state", "phone", "website")}
+_real_post = requests.post
+requests.post = lambda *a, **k: posts.append(1) or boom()
+try:
+    resp, err, retryable = gp.call_once("p", "m", "k", 5)
+    check("call_once without --gemini: error, not retryable, and requests.post was never reached",
+          resp is None and "off" in err and retryable is False and posts == [])
+    out = gp.ask_gemini(E0_LEAD, "k")
+    check("ask_gemini without --gemini and no injected call: status off, zero attempts, no network",
+          out["status"] == "off" and out["attempts"] == 0 and posts == [])
+    out_inj = gp.ask_gemini(E0_LEAD, "k", call=lambda *a: (None, "HTTP 503: x", False))
+    check("an injected call (tests) still runs when the switch is off", out_inj["status"] == "error" and "503" in out_inj["error"])
+    gp.allow_gemini(True)
+    try:
+        gp.call_once("p", "m", "k", 5)
+    except Exception:
+        pass
+    check("with the switch on, call_once does reach requests.post (the test double blocks it)", posts == [1])
+finally:
+    gp.allow_gemini(False)
+    requests.post = _real_post
+requests.post = boom
+check("confirm_opt_in: 'n' keeps calls off, 'y' turns them on, the prompt carries the cost note",
+      (not gp.confirm_opt_in(3, input_fn=lambda p: "n")) and not gp.is_allowed()
+      and gp.confirm_opt_in(3, input_fn=lambda p: "y") and gp.is_allowed() and "cause unconfirmed" in gp.COST_NOTE)
+gp.allow_gemini(False)
+check("reconcile: status off -> case gemini_off, the Brave answer kept", rc.reconcile(
+    {"first": "Ann", "last": "Lee", "title": "Owner", "confidence": "high", "evidence": {}}, {"status": "off"})["case"] == "gemini_off")
+check("reconcile: status error/disabled keep the old case gemini_unavailable", all(rc.reconcile(None, {"status": s})["case"] == "gemini_unavailable"
+                                                                                    for s in ("error", "disabled")))
+
 # --- ask_gemini: time cap, one retry, error fallback ---------------------------------------------
 LEAD = {"business_name": "Zephyr Cuts", "address": "1 Main St", "city": "Charlotte", "state": "NC", "phone": "", "website": "https://zephyr.example"}
 ANSWER = {"candidates": [{"content": {"parts": [{"text": 'Jane Rivera owns it.\n{"owner_first_name": "Jane", "owner_last_name": "Rivera", '
@@ -263,6 +297,10 @@ check("the key is sent in a header, never in a URL", "key" not in gp.ENDPOINT)
 sys.stdout.flush()
 import first_graph as fg                                # noqa: E402
 logging.disable(logging.CRITICAL)
+# Gemini is OFF by default (stage E0). These graph tests exercise the two-path join with a FAKE ask_gemini, so they
+# turn the node on; gemini_path's own network switch (allow_gemini) stays off and no real call can happen.
+check("Gemini defaults: the graph node is off and the network switch is off", fg.GEMINI_ENABLED is False and not gp.is_allowed())
+fg.GEMINI_ENABLED = True
 
 
 def owner(first, last, title="Owner", conf="high", snippet="", url="", **kw):
@@ -593,6 +631,24 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     c2_report.report(recs[:3] + [dict(recs[3], gemini_status="disabled", gemini_grade="disabled")], GT_BY_ID)
 check("the report calls out rows where Gemini was disabled by a 402", "Gemini was DISABLED mid-run" in buf.getvalue() and "1 row(s)" in buf.getvalue())
+
+# --- Stage E0 / D3: a run without --gemini is recorded as off and reported as such ------------------------------
+off_recs = [dict(r, gemini_status="off", gemini_grade="off", reconcile_case="gemini_off", gemini_attempts=0, review_candidates="")
+            for r in recs]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    c2_report.report(off_recs, GT_BY_ID)
+t_off = buf.getvalue()
+check("Gemini-off report: says 'Gemini off by choice, C2 gate not applicable', no 402 banner, no FAIL line, no Gemini error rate",
+      "Gemini off by choice, C2 gate not applicable" in t_off and "DISABLED" not in t_off and "FAIL" not in t_off
+      and "error rate this run" not in t_off)
+check("Gemini-off report: the Brave-only checks still print, including 0 Gemini requests", "PASS  Gemini requests made: 0" in t_off)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    c2_report.report([dict(off_recs[0], gemini_attempts=2)] + off_recs[1:], GT_BY_ID)
+check("Gemini-off report fails the 0-request check if Gemini was actually called", "FAIL  Gemini requests made: 2" in buf.getvalue())
+check("old labels still count: a 'disabled' row is excluded from Gemini alone, an 'off' row too",
+      c2_report.alone_grades([dict(off_recs[0], gemini_grade="off"), dict(recs[0], gemini_grade="disabled")], "gemini") == [])
 
 # --- Option 5 offline simulation = the production reconcile on the saved result CSVs ----------------------------
 sim_files = [("eval/data/results_20261007_082954.csv", "eval/data/results_gemini_20261005_215033_raw.csv", (19, 19, 2, 3, 25, 24)),

@@ -40,8 +40,9 @@ load_dotenv(r"C:\Users\marvi\.secrets\langgraph.env")
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.db")
 
-# Stage C2: Gemini is the second path. GEMINI_ENABLED False skips it (the Brave answer is then delivered unchanged).
-GEMINI_ENABLED = True
+# Stage C2: Gemini is the second path. Stage E0: it is OFF unless the run opts in with --gemini, which sets this
+# and gemini_path.allow_gemini(True). Off, the Brave answer is delivered unchanged and the row records gemini_status=off.
+GEMINI_ENABLED = False
 GEMINI_MODEL = gemini_path.MODEL
 # Leads processed at the same time. Each lead fires up to 5 Brave searches at once, so N workers put at most
 # 5*N requests in flight; Brave allows 50 per second (x-ratelimit-policy 50;w=1).
@@ -1327,7 +1328,7 @@ def gemini_search(state: LeadState) -> dict:
     """Second path (stage C2). Runs next to the Brave branch and writes ONLY the 'gemini' key. It never raises: a
     timeout, an empty response or any failure is status 'error', and reconcile then keeps the Brave answer."""
     if not GEMINI_ENABLED:
-        return {"gemini": {"status": "disabled", "error": None}}
+        return {"gemini": {"status": "off", "error": None}}
     lead = {k: state.get(k) or "" for k in ("business_name", "address", "city", "state", "phone", "website")}
     try:
         res = gemini_path.ask_gemini(lead, os.getenv("GEMINI_API_KEY"), model=GEMINI_MODEL)
@@ -1759,4 +1760,16 @@ def process_leads_batch(csv_path: str = "MBG_-_Charlotte_Barbershops_-_Charlotte
 
 
 if __name__ == "__main__":
-    process_leads_batch()
+    import argparse
+    ap = argparse.ArgumentParser(description="Run the enrichment pipeline on every lead in leads.db.")
+    ap.add_argument("--gemini", action="store_true",
+                    help="OPT IN to the Gemini path (costs money; ~$0.45/lead observed Oct 7, cause unconfirmed). Default: off")
+    ap.add_argument("--no-gemini", action="store_true", help="accepted for compatibility; Gemini is off unless --gemini is given")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="leads processed at the same time")
+    ap.add_argument("--yes", action="store_true", help="skip the Gemini cost confirmation")
+    cli = ap.parse_args()
+    if cli.gemini and not cli.no_gemini:
+        if not gemini_path.confirm_opt_in(len(LeadDatabase().get_all_leads()), cli.yes):
+            raise SystemExit("Cancelled. Nothing was spent.")
+        GEMINI_ENABLED = True
+    process_leads_batch(workers=cli.workers)
