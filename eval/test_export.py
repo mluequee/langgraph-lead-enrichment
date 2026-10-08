@@ -27,6 +27,7 @@ sys.path.insert(0, HERE)
 # use (or even see) the real keys.
 os.environ["ANTHROPIC_API_KEY"] = "test-key-not-real"
 os.environ["BRAVE_API_KEY"] = "test-key-not-real"
+os.environ["GEMINI_API_KEY"] = "test-key-not-real"      # the Gemini path must never reach the network here
 
 import evidence as ev                                   # noqa: E402
 import export                                           # noqa: E402
@@ -236,13 +237,18 @@ def run_lead(haiku, sonnet=None, brave=None, brave_fails=False, website="", abou
             return SimpleNamespace(status_code=200, text=ABOUT_HTML)
         return SimpleNamespace(status_code=404, text="")
 
-    saved = (fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key)
+    def no_network(*a, **k):
+        raise AssertionError("a test tried to make a real POST")
+
+    saved = (fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key, requests.post, fg.gemini_path.ask_gemini)
     fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key = haiku, sonnet, fake_get, "k"
+    requests.post = no_network                           # any real Gemini call would fail this test loudly
+    fg.gemini_path.ask_gemini = lambda *a, **k: {"status": "error", "error": "fake: offline test", "cost_usd": 0.0, "seconds": 0.0}
     try:
         res = fg.app.invoke({"business_name": "Zephyr Cuts", "lead_id": 1, "website": website, "address": "1 Main St, Charlotte, NC 28202, USA",
                              "phone": "", "city": "Charlotte", "state": "NC"})
     finally:
-        fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key = saved
+        fg.structured_model, fg.reasoning_model, requests.get, fg.brave_key, requests.post, fg.gemini_path.ask_gemini = saved
     return res, haiku, sonnet
 
 

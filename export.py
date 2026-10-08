@@ -7,6 +7,8 @@ Also called at the end of process_leads_batch. Every lead in the database appear
 its most recent result (the `results` table has no uniqueness rule, so re-runs are collapsed here).
 
 `outcome` is the column to filter on:
+    needs_review    stage C2: the Brave and Gemini paths named DIFFERENT people (co-owners can both be right).
+                    No name is delivered; review_candidates holds both candidates with their sources.
     found           a name was delivered; evidence_url should be filled (the count of found rows
                     without one is printed and returned, the stage A gate wants 0)
     no_owner_found  a real blank: everything ran and no owner could be backed with evidence.
@@ -35,9 +37,9 @@ COLUMNS = [
     "outcome", "owner_first_name", "owner_last_name", "goes_by_name", "title", "confidence",
     "source_tier", "evidence_url", "evidence_url_kind", "evidence_domain", "evidence_source",
     "other_evidence_urls", "instagram", "tiktok", "facebook", "linkedin",
-    "error_detail", "skip_reason", "processed_at",
+    "reconcile_case", "review_candidates", "error_detail", "skip_reason", "processed_at",
 ]
-OUTCOME_ORDER = {"found": 0, "no_owner_found": 1, "error": 2, "skipped": 3}
+OUTCOME_ORDER = {"found": 0, "needs_review": 1, "no_owner_found": 2, "error": 3, "skipped": 4}
 
 
 def _rows(conn, sql):
@@ -70,6 +72,7 @@ def build_rows(db_path):
             row.update(outcome="error", error_detail="no result recorded for this lead")
         else:
             row["processed_at"] = res.get("processed_at")
+            row["reconcile_case"] = res.get("reconcile_case")
             first = evidence.none_if_empty(res.get("decision_maker_first_name"))
             last = evidence.none_if_empty(res.get("decision_maker_last_name"))
             legacy_error = "<ERROR>" in (str(res.get("decision_maker_first_name")).upper(),
@@ -87,6 +90,8 @@ def build_rows(db_path):
                     evidence_url_kind=res.get("evidence_url_kind"), evidence_domain=res.get("evidence_domain"),
                     evidence_source=res.get("evidence_source"), other_evidence_urls=res.get("other_evidence_urls"),
                     **{k: evidence.none_if_empty(res.get(k)) for k in ("instagram", "tiktok", "facebook", "linkedin")})
+            elif res.get("reconcile_case") == "conflict" and res.get("review_candidates"):
+                row.update(outcome="needs_review", review_candidates=res.get("review_candidates"))
             else:
                 row["outcome"] = "no_owner_found"
         out.append(row)

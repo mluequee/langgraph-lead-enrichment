@@ -23,7 +23,9 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 EVAL = os.path.dirname(os.path.abspath(__file__))
@@ -32,10 +34,12 @@ sys.path.insert(0, EVAL)
 sys.path.insert(0, ROOT)
 from scoring import judge, summarize, fmt, norm_tokens  # noqa: E402
 import intake                                             # noqa: E402
+import c2_report                                          # noqa: E402
 
 GT = os.path.join(EVAL, "data", "ground_truth.json")
 DB = os.path.join(ROOT, "leads.db")
-EST_COST_PER_LEAD = 0.03          # 08-25 run averaged $0.027/lead
+EST_COST_PER_LEAD = 0.07          # stage C2: Brave + Anthropic ~$0.035 plus Gemini ~$0.04 at list price
+DEFAULT_REFS = ["eval/data/results_20261007_085218.csv", "eval/data/results_20261005_080444.csv"]
 BASELINE = ("PRE-A0 baseline (unmodified code, 2026-09-25, 2 runs, 47 audit rows incl. the 3 now excluded by intake): "
             "lenient 18/42, 17/42 | strict 12/42, 13/42 | correct blanks 0/4. History only: the filtered set has its own "
             "baseline (stage A0). Noise ~1-2 correct.")
@@ -43,7 +47,13 @@ FIELDS = ["id", "business_name", "subset", "first", "last", "confidence",
           "verified_confidence", "grade", "truth", "why_this_person", "cost_usd", "seconds", "error",
           # stage A: evidence and status (record-keeping; the grade never reads source_tier)
           "goes_by_name", "delivered_confidence", "source_tier", "evidence_url", "evidence_url_kind",
-          "evidence_domain", "evidence_source", "other_evidence_urls", "status"]
+          "evidence_domain", "evidence_source", "other_evidence_urls", "status",
+          # stage C2: each path's own answer from the same run, and what reconcile did
+          "reconcile_case", "review_candidates", "brave_first", "brave_last", "brave_grade",
+          "gemini_first", "gemini_last", "gemini_grade", "gemini_status", "gemini_error", "gemini_seconds",
+          "gemini_cost_usd", "gemini_attempts", "gemini_searches",
+          # recording only: Brave searches, 429s, retries that recovered, searches that errored
+          "brave_calls", "brave_429", "brave_429_recovered", "brave_search_errors"]
 
 
 def key(name):
@@ -116,9 +126,11 @@ def select(rows, subset, limit):
     return picked[:limit] if limit else picked
 
 
-def run_pipeline(rows, verbose):
+def run_pipeline(rows, verbose, workers=4, use_gemini=True):
     sys.path.insert(0, ROOT)
     import first_graph                                    # noqa: E402  (loads keys, builds graph)
+    first_graph.GEMINI_ENABLED = use_gemini
+    first_graph.gemini_path.reset()      # a 402 disables Gemini for this run only
     if not verbose:
         logging.getLogger("first_graph").setLevel(logging.WARNING)
         logging.getLogger("__main__").setLevel(logging.WARNING)
@@ -132,8 +144,10 @@ def run_pipeline(rows, verbose):
             print(f"  - {m}")
     found = [(r, l) for r, l in found if l is not None]
 
-    out = []
-    for i, (row, lead) in enumerate(found, 1):
+    lock, done = threading.Lock(), [0]
+
+    def one(item):
+        row, lead = item
         rec = {"id": row["id"], "business_name": row["business_name"], "subset": row["subset"],
                "truth": truth_text(row), "error": ""}
         t0 = time.time()
@@ -145,8 +159,21 @@ def run_pipeline(rows, verbose):
                        confidence=res.get("confidence", ""),
                        verified_confidence=res.get("verified_confidence", ""),
                        why_this_person=(res.get("why_this_person") or "")[:300],
-                       cost_usd=round(cost.estimated_cost_usd(), 4) if cost else 0.0,
+                       cost_usd=round((cost.estimated_cost_usd() if cost else 0.0)
+                                      + ((res.get("gemini") or {}).get("cost_usd") or 0.0), 4),
                        status=res.get("status") or "ok")
+            b, g = res.get("brave_answer") or {}, res.get("gemini") or {}
+            rec.update(reconcile_case=res.get("reconcile_case") or "", review_candidates=res.get("review_candidates") or "",
+                       brave_first=b.get("first") or "", brave_last=b.get("last") or "",
+                       gemini_first=g.get("first") or "", gemini_last=g.get("last") or "",
+                       gemini_status=g.get("status") or "", gemini_error=(g.get("error") or "")[:200],
+                       gemini_seconds=g.get("seconds") or 0, gemini_cost_usd=g.get("cost_usd") or 0,
+                       gemini_attempts=g.get("attempts") or 0, gemini_searches=g.get("searches") or 0,
+                       brave_calls=cost.brave_calls if cost else 0, brave_429=cost.brave_429 if cost else 0,
+                       brave_429_recovered=cost.brave_429_recovered if cost else 0,
+                       brave_search_errors=len(cost.brave_errors) if cost else 0)
+            rec["brave_grade"] = judge(rec["brave_first"], rec["brave_last"], row)
+            rec["gemini_grade"] = judge(rec["gemini_first"], rec["gemini_last"], row) if g.get("status") == "ok" else (g.get("status") or "error")
             for k in ("goes_by_name", "delivered_confidence", "source_tier", "evidence_url", "evidence_url_kind",
                       "evidence_domain", "evidence_source", "other_evidence_urls"):
                 rec[k] = res.get(k) or ""
@@ -156,12 +183,18 @@ def run_pipeline(rows, verbose):
                 rec["grade"] = judge(rec["first"], rec["last"], row)
         except Exception as e:                            # the eval must finish even if a lead fails
             rec.update(first="", last="", confidence="", verified_confidence="",
-                       why_this_person="", cost_usd=0.0, grade="error", error=str(e)[:300], status="error")
+                       why_this_person="", cost_usd=0.0, grade="error", error=str(e)[:300], status="error",
+                       brave_grade="error", gemini_grade="error")
         rec["seconds"] = round(time.time() - t0, 1)
-        out.append(rec)
-        print(f"[{i}/{len(found)}] {rec['business_name'][:40]:40} -> "
-              f"{(rec['first'] + ' ' + rec['last']).strip()[:28]:28} ({rec['confidence']}) {rec['grade']}")
-    return out
+        with lock:
+            done[0] += 1
+            print(f"[{done[0]}/{len(found)}] {rec['business_name'][:40]:40} -> "
+                  f"{(rec['first'] + ' ' + rec['last']).strip()[:28]:28} ({rec['confidence']}) {rec['grade']}"
+                  f" [{rec.get('reconcile_case') or '-'}] {rec['seconds']}s", flush=True)
+        return rec
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:       # leads in parallel, output in row order
+        return list(pool.map(one, found))
 
 
 def rescore(path, rows, excluded):
@@ -177,8 +210,15 @@ def rescore(path, rows, excluded):
             else:
                 rec["grade"] = "error" if rec.get("error") else judge(rec["first"], rec["last"], row)
             rec["truth"] = truth_text(row)
+            if "brave_first" in rec and row["id"] not in excluded:       # stage C2 CSVs: regrade each path too
+                rec["brave_grade"] = judge(rec["brave_first"], rec["brave_last"], row)
+                rec["gemini_grade"] = (judge(rec["gemini_first"], rec["gemini_last"], row)
+                                       if rec.get("gemini_status") == "ok" else (rec.get("gemini_status") or "error"))
             out.append(rec)
     return out
+
+
+GT_ROWS = []          # filled by main() so report() can grade review candidates
 
 
 def report(recs):
@@ -195,6 +235,8 @@ def report(recs):
         missing = [r for r in named if not r.get("evidence_url")]
         print(f"Named rows without an evidence URL: {len(missing)} of {len(named)}"
               + ("" if not missing else " -> " + ", ".join(r["business_name"] for r in missing)))
+
+    c2_report.report(recs, {r["id"]: r for r in GT_ROWS})
 
     errors = [r for r in recs if r["grade"] == "error"]
     if errors:
@@ -227,6 +269,10 @@ def main():
     ap.add_argument("--rescore", metavar="CSV", help="re-grade a saved results CSV, no API calls")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
     ap.add_argument("--verbose", action="store_true", help="show the pipeline's own logging")
+    ap.add_argument("--workers", type=int, default=4, help="leads processed at the same time (default 4)")
+    ap.add_argument("--no-gemini", action="store_true", help="skip the Gemini path (the Brave answer is delivered)")
+    ap.add_argument("--ref", nargs="*", default=None, metavar="CSV",
+                    help="earlier results CSVs to list row-by-row differences against (default: stage A run 2, A0 run 2)")
     a = ap.parse_args()
 
     if not os.path.exists(GT):
@@ -236,20 +282,32 @@ def main():
 
     excluded = excluded_rows(gt)
     print_excluded(gt, excluded)
+    GT_ROWS[:] = gt
+
+    def print_diffs(recs):
+        for ref in (a.ref if a.ref is not None else DEFAULT_REFS):
+            if os.path.exists(os.path.join(ROOT, ref) if not os.path.isabs(ref) else ref):
+                p = ref if os.path.isabs(ref) else os.path.join(ROOT, ref)
+                c2_report.diff_vs(recs, rescore(p, gt, excluded), os.path.basename(p))
 
     if a.rescore:
-        report(rescore(a.rescore, gt, excluded))
+        recs = rescore(a.rescore, gt, excluded)
+        report(recs)
+        print_diffs(recs)
         return
 
     rows = [r for r in select(gt, a.subset, 0) if r["id"] not in excluded]
     if a.limit:
         rows = rows[:a.limit]
     est = len(rows) * EST_COST_PER_LEAD
-    print(f"About to run the pipeline on {len(rows)} shop(s). Estimated cost ~${est:.2f} (Anthropic + Brave).")
+    print(f"About to run the pipeline on {len(rows)} shop(s), {a.workers} at a time, Gemini "
+          f"{'off' if a.no_gemini else 'on'}. Estimated cost ~${est:.2f} at list price (Anthropic + Brave + Gemini).")
     if not a.yes and input("Proceed? [y/N] ").strip().lower() != "y":
         raise SystemExit("Cancelled. Nothing was spent.")
 
-    recs = run_pipeline(rows, a.verbose)
+    run_start = time.time()
+    recs = run_pipeline(rows, a.verbose, a.workers, not a.no_gemini)
+    wall = time.time() - run_start
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(EVAL, "data", f"results_{stamp}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -257,6 +315,8 @@ def main():
         w.writeheader()
         w.writerows(recs)
     report(recs)
+    print(f"Wall time: {wall:.0f}s ({wall / 60:.1f} min), {a.workers} workers")
+    print_diffs(recs)
     print(f"Saved: {path}")
 
 
