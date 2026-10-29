@@ -1,12 +1,18 @@
 """Production entry point: run the graph over every lead in leads.db, record the results, write the export.
 
-    python src/run.py [--gemini] [--workers N]
+    python src/run.py [--gemini] [--workers N] [--data-dir data/<city>/<folder>]
+
+--data-dir (stage F) reads leads from, and writes every output to, one folder under <repo>/data/, so a second
+city never touches the Charlotte leads.db / enriched_leads.csv / langgraph_debug.log. Without it nothing changes.
 
 Moved from first_graph.py. lead_to_input() is the ONE place that builds the graph's input; the eval harness uses it too.
 """
 import argparse
 import csv
+import logging
 import os
+import pathlib
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -47,13 +53,71 @@ def gemini_error_rate(results):
     ok, err = st.count("ok"), st.count("error")
     return ok, err, (err / (ok + err) if ok + err else 0.0)
 
-def process_leads_batch(workers: int = DEFAULT_WORKERS):
+def redirect_debug_log(log_path):
+    """Point the pipeline's debug log at log_path (stage F).
+
+    graph.py attaches a FileHandler for a relative 'langgraph_debug.log' to the root logger when it is imported,
+    and the gate forbids editing graph.py. A data-folder run must not write owner names into the repo-root log
+    (it would leak answers before verification and mix cities), so this removes that handler and attaches one
+    that writes to log_path with the same format. Safe to call twice. Returns the absolute path."""
+    root = logging.getLogger()
+    target = os.path.abspath(log_path)
+    formatter, present = None, False
+    for h in list(root.handlers):
+        if not isinstance(h, logging.FileHandler):
+            continue
+        if h.baseFilename == target:
+            present = True
+        elif os.path.basename(h.baseFilename) == "langgraph_debug.log":
+            formatter = formatter or h.formatter
+            root.removeHandler(h)
+            h.close()
+    if not present:
+        h = logging.FileHandler(target, encoding="utf-8")
+        h.setFormatter(formatter or logging.Formatter("%(levelname)s - %(message)s"))
+        root.addHandler(h)
+    return target
+
+
+def _place_ids(db_path):
+    """Place IDs in a database, opened read-only (this can never modify the file)."""
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return {r[0] for r in conn.execute("SELECT place_id FROM leads") if r[0]}
+    finally:
+        conn.close()
+
+
+def preflight_data_dir(db_path, charlotte_db=paths.DB_PATH):
+    """Checks before a data-folder run spends anything. Returns the lead count, or raises SystemExit.
+
+    Refuses: a missing or empty database, and any Place ID that is also in the Charlotte database (a city
+    mix-up; the Charlotte file is opened read-only)."""
+    if not os.path.exists(db_path):
+        raise SystemExit(f"No database at {db_path}. Build it first: python src/setup_database.py --data-dir ... --csv ...")
+    ids = _place_ids(db_path)
+    if not ids:
+        raise SystemExit(f"{db_path} has no leads. Nothing was run.")
+    if os.path.exists(charlotte_db) and os.path.abspath(charlotte_db) != os.path.abspath(db_path):
+        overlap = ids & _place_ids(charlotte_db)
+        if overlap:
+            raise SystemExit(f"{len(overlap)} Place ID(s) in {db_path} are also in the Charlotte leads.db "
+                             f"({', '.join(sorted(overlap)[:3])}...). Wrong city or wrong file. Nothing was run.")
+    return len(ids)
+
+
+def process_leads_batch(workers: int = DEFAULT_WORKERS, data_dir=None):
     """Process every lead in the database: run the graph, record the results, write the enriched export.
-    The comparison against the n8n baseline lives in eval/compare_n8n.py (it reads leads.db afterwards)."""
-    db = LeadDatabase()
+    The comparison against the n8n baseline lives in eval/compare_n8n.py (it reads leads.db afterwards).
+    data_dir (stage F): read and write everything in that folder; None keeps the repo-root files."""
+    p = paths.data_paths(data_dir)
+    if data_dir is not None:
+        redirect_debug_log(p["log"])        # before anything logs, so no names reach the repo-root log
+    db = LeadDatabase(p["db"])
     gemini_path.reset()          # a 402 disables Gemini for ONE batch only
     leads, skipped = intake.filter_leads(db.get_all_leads(), log=logger)
-    skipped_path = intake.write_skipped_file(skipped)
+    skipped_path = intake.write_skipped_file(skipped, p["skipped"])
     logger.info(f"Skipped leads written to {skipped_path}")
 
     logger.info(f"\n{'='*80}")
@@ -110,7 +174,7 @@ def process_leads_batch(workers: int = DEFAULT_WORKERS):
     logger.info(f"Brave: {sum(c.brave_calls for c in _costs)} searches, {sum(c.brave_429 for c in _costs)} rate-limited (429), "
                 f"{sum(c.brave_429_recovered for c in _costs)} recovered on retry, {sum(len(c.brave_errors) for c in _costs)} searches errored")
     try:     # stored per batch next to the per-lead gemini_status/gemini_error columns
-        stats_path = paths.BATCH_STATS_PATH
+        stats_path = p["batch_stats"]
         new = not os.path.exists(stats_path)
         with open(stats_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -147,7 +211,7 @@ def process_leads_batch(workers: int = DEFAULT_WORKERS):
 
     # Stage A: the enriched CSV (one row per lead, errors apart from blanks, skips listed)
     try:
-        out_path, counts = export.write_export(db.db_path)
+        out_path, counts = export.write_export(db.db_path, p["export"])
         logger.info(f"Enriched export written to {out_path}: {counts}\n")
     except Exception as e:
         logger.error(f"Export failed: {e}\n")
@@ -160,9 +224,20 @@ if __name__ == "__main__":
     ap.add_argument("--no-gemini", action="store_true", help="accepted for compatibility; Gemini is off unless --gemini is given")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="leads processed at the same time")
     ap.add_argument("--yes", action="store_true", help="skip the Gemini cost confirmation")
+    ap.add_argument("--data-dir", metavar="DIR",
+                    help="stage F: read leads from, and write every output to, DIR (a folder under <repo>/data/)")
     cli = ap.parse_args()
+    try:
+        file_paths = paths.data_paths(cli.data_dir)
+    except ValueError as e:
+        raise SystemExit(f"{e}. Nothing was run.")
+    if cli.data_dir:
+        n_leads = preflight_data_dir(file_paths["db"])
+        print(f"Data folder: {os.path.dirname(file_paths['db'])}")
+        print(f"Leads in it: {n_leads}   Workers: {cli.workers}   "
+              f"Gemini: {'ON' if cli.gemini and not cli.no_gemini else 'off'}")
     if cli.gemini and not cli.no_gemini:
-        if not gemini_path.confirm_opt_in(len(LeadDatabase().get_all_leads()), cli.yes):
+        if not gemini_path.confirm_opt_in(len(LeadDatabase(file_paths["db"]).get_all_leads()), cli.yes):
             raise SystemExit("Cancelled. Nothing was spent.")
         graph.GEMINI_ENABLED = True            # the node reads the flag in graph.py, not this module
-    process_leads_batch(workers=cli.workers)
+    process_leads_batch(workers=cli.workers, data_dir=cli.data_dir)

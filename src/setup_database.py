@@ -53,20 +53,22 @@ def parse_city_state(address: str) -> tuple[str, str]:
     return city, state
 
 
-def init_database(reset: bool = False):
+def init_database(reset: bool = False, db_path: str = None):
     """Create SQLite database with leads and results tables.
 
     Refuses to touch an existing DB unless reset=True (was previously
     an unconditional os.remove that destroyed the DB on every run).
+    db_path defaults to DB_PATH (read at call time); stage F passes a per-dataset path.
     """
-    if os.path.exists(DB_PATH):
+    db_path = db_path or DB_PATH
+    if os.path.exists(db_path):
         if not reset:
             raise SystemExit(
-                f"{DB_PATH} already exists. Pass --reset to wipe and recreate it."
+                f"{db_path} already exists. Pass --reset to wipe and recreate it."
             )
-        os.remove(DB_PATH)
+        os.remove(db_path)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -127,23 +129,25 @@ def init_database(reset: bool = False):
 
     conn.commit()
     conn.close()
-    print(f"Database initialized at {DB_PATH}")
+    print(f"Database initialized at {db_path}")
 
 
-def seed_data_from_csv(csv_path):
+def seed_data_from_csv(csv_path, db_path: str = None):
     """Load leads from CSV file (business_name, website, address, phone, place_id).
 
     Dedupes on place_id (business_name is not unique in the source sheet -
     e.g. "Modern Man" and "The Cut Barbershop" each appear twice).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path or DB_PATH)
     cursor = conn.cursor()
 
     count = 0
     skipped = 0
     unparsed_address = 0
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    # utf-8-sig: a Drive/Excel export that starts with a byte-order mark would otherwise make the first
+    # header read as 'business_name' with a hidden BOM in front, and every row would look like it has no name and be skipped.
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
             business_name = row.get('business_name', '').strip()
@@ -186,10 +190,35 @@ def seed_data_from_csv(csv_path):
         print(f"    ({unparsed_address} leads have an address that didn't parse into city/state)")
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    import paths
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reset", action="store_true", help="wipe and recreate an existing leads.db")
-    args = ap.parse_args()
+    ap.add_argument("--reset", action="store_true", help="wipe and recreate an existing database")
+    ap.add_argument("--data-dir", metavar="DIR",
+                    help="stage F: build the database inside DIR (must be a folder under <repo>/data/) instead of "
+                         "leads.db in the current folder. Requires --csv.")
+    ap.add_argument("--csv", metavar="FILE", help="lead CSV to seed from (required with --data-dir)")
+    args = ap.parse_args(argv)
+
+    if args.csv and not args.data_dir:
+        raise SystemExit("--csv needs --data-dir. Without it the target is the Charlotte leads.db, and "
+                         "--reset would wipe it. Nothing was touched.")
+    if args.data_dir and not args.csv:
+        raise SystemExit("--data-dir needs --csv. Seeding the default Charlotte CSV into another city's "
+                         "database would be a mistake. Nothing was touched.")
+
+    if args.data_dir:
+        try:
+            folder = paths.resolve_data_dir(args.data_dir)
+        except ValueError as e:
+            raise SystemExit(f"{e}. Nothing was touched.")
+        db_path, csv_path = os.path.join(folder, "leads.db"), args.csv
+        if not os.path.exists(csv_path):
+            raise SystemExit(f"CSV file not found: {csv_path}. Nothing was touched.")
+        os.makedirs(folder, exist_ok=True)
+        init_database(reset=args.reset, db_path=db_path)
+        seed_data_from_csv(csv_path, db_path=db_path)
+        return
 
     init_database(reset=args.reset)
 
@@ -200,3 +229,7 @@ if __name__ == "__main__":
         print(f"    Place the CSV in: {os.getcwd()}")
     else:
         seed_data_from_csv(csv_path)
+
+
+if __name__ == "__main__":
+    main()
