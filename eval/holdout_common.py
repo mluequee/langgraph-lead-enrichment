@@ -69,3 +69,23 @@ def read_clean_csv(path):
     """The clean lead CSV as a list of dicts (utf-8-sig, so a byte-order mark never breaks the first header)."""
     with open(path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
+
+
+# --- the verification worksheet (protocol section 6) -----------------------------------------------------
+VERDICT_OWNER = "Owner found"
+VERDICT_NO_OWNER = "No owner public"
+VERDICT_AMBIGUOUS = "Ambiguous"
+VERDICT_UNDETERMINED = "Not determined"
+VERDICTS = [VERDICT_OWNER, VERDICT_NO_OWNER, VERDICT_AMBIGUOUS, VERDICT_UNDETERMINED]
+
+# Decision D5: the six original types plus four more.
+SOURCE_TYPES = ["LinkedIn", "News", "BBB", "Booksy", "Video", "Directory",
+                "Own website", "Social (IG/FB)", "GA registry", "Other"]
+
+# One row per lead. Everything left of `verdict` comes from the lead list; everything from `verdict` on is
+# filled in by hand, blind. `place_id` is the join key to the pipeline's export.
+VERIFY_COLUMNS = ["#", "place_id", "business_name", "address", "phone", "website", "google_url",
+                  "verdict", "owner_first", "owner_last", "goes_by", "co_owner_first", "co_owner_last",
+                  "source_type", "source_url", "source_type_2", "source_url_2", "checked", "minutes", "notes"]
+FIRST_HAND_COLUMN = VERIFY_COLUMNS.index("verdict")
+CHECKED_VALUES = ["Yes", "No"]
