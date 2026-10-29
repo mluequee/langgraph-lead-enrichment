@@ -35,6 +35,12 @@ check("paths: ROOT is the repo root and the data files sit directly in it",
       paths.ROOT == ROOT and paths.DB_PATH == os.path.join(ROOT, "leads.db")
       and paths.EXPORT_PATH == os.path.join(ROOT, "enriched_leads.csv") and paths.BATCH_STATS_PATH == os.path.join(ROOT, "batch_stats.csv"))
 
+check("stage F: paths.data_paths() with no folder is exactly the root layout (and the five names are fixed)",
+      paths.data_paths() == paths.data_paths(None)
+      and paths.data_paths()["db"] == paths.DB_PATH and paths.data_paths()["export"] == paths.EXPORT_PATH
+      and paths.data_paths()["batch_stats"] == paths.BATCH_STATS_PATH
+      and sorted(paths.data_paths()) == ["batch_stats", "db", "export", "log", "skipped"])
+
 import graph                                                     # noqa: E402
 import db                                                        # noqa: E402
 import cost                                                      # noqa: E402
