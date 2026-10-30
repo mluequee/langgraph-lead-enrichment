@@ -3,8 +3,8 @@
     python eval/seal_holdout.py data/atlanta/sealed
 
 Run it right after the cold run, from the same PowerShell window. It writes SEAL.txt in the sealed folder:
-the SHA-256 of every output file, the git commit and whether the frozen pipeline files still equal stage-e-done,
-and the outcome counts. The scorer (eval/score_holdout.py) refuses to run if the export no longer matches
+the SHA-256 of every output file, the git commit, the frozen-source check (PASS/FAIL and the number of added denylist
+entries; see eval/frozen_check.py) and the outcome counts. The scorer (eval/score_holdout.py) refuses to run if the export no longer matches
 SEAL.txt, so the answers cannot change between the run and the scoring.
 
 It never prints, copies or summarizes a name. It refuses to run twice on the same folder (a second seal could
@@ -23,11 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "src"))
+import frozen_check                               # noqa: E402
 import holdout_common as hc                       # noqa: E402
 import paths                                      # noqa: E402
 
 SEALED_FILES = ["leads.db", "enriched_leads.csv", "batch_stats.csv", "skipped_leads.csv", "langgraph_debug.log", "console.txt"]
-FROZEN_SRC = ["src/graph.py", "src/reconcile.py", "src/gemini_path.py", "src/evidence.py", "src/intake.py"]
 
 
 def _git(*args):
@@ -40,11 +40,12 @@ def _git(*args):
 
 def git_facts():
     head = (_git("rev-parse", "HEAD") or "unknown").strip()
-    diff = _git("diff", "stage-e-done", "--", *FROZEN_SRC)
     dirty = _git("status", "--porcelain", "--", "src")
+    status, added, problems = frozen_check.git_frozen_check()
     return {"git_commit": head,
-            "frozen_src_diff_lines": str(len(diff.splitlines())) if diff is not None else "unknown",
-            "src_uncommitted_changes": ("yes" if dirty.strip() else "no") if dirty is not None else "unknown"}
+            "frozen_source_check": status,                     # PASS / FAIL / UNKNOWN (eval/frozen_check.py, protocol Amendments)
+            "denylist_lines_added": str(added),
+            "src_uncommitted_changes": ("yes" if dirty.strip() else "no") if dirty is not None else "unknown"}, problems
 
 
 def count_outcomes(export_csv):
@@ -79,7 +80,7 @@ def seal(folder):
 
     total, outcomes, found_no_ev = count_outcomes(export)
     gem = gemini_status_counts(db)
-    facts = git_facts()
+    facts, frozen_problems = git_facts()
     lines = [f"sealed_at: {datetime.datetime.now().isoformat(timespec='seconds')}"]
     lines += [f"{k}: {v}" for k, v in facts.items()]
     for name in SEALED_FILES:
@@ -97,8 +98,9 @@ def seal(folder):
                f"  leads {total}   errors {outcomes.get('error', 0)}   found without an evidence URL {found_no_ev}"]
     if set(gem) - {"off"}:
         printed.append("  WARNING: some results are not gemini_status=off; this was supposed to be a Brave-only run")
-    if facts["frozen_src_diff_lines"] not in ("0",):
-        printed.append(f"  WARNING: the frozen pipeline files differ from stage-e-done ({facts['frozen_src_diff_lines']} diff lines)")
+    if facts["frozen_source_check"] != "PASS":
+        printed.append(f"  WARNING: frozen source check is {facts['frozen_source_check']}: the pipeline code is not the frozen stage-e-done "
+                       "code plus denylist lines. Run python eval/frozen_check.py for the reason.")
     if facts["src_uncommitted_changes"] != "no":
         printed.append(f"  WARNING: src/ has uncommitted changes ({facts['src_uncommitted_changes']})")
     printed.append("  SEAL.txt written (hashes and counts only). Do not open this folder until the worksheet is complete.")
@@ -118,8 +120,15 @@ def read_seal(folder):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("sealed_dir", help="the data folder the cold run wrote to (under <repo>/data/)")
+    ap.add_argument("sealed_dir", nargs="?", help="the data folder the cold run wrote to (under <repo>/data/)")
+    ap.add_argument("--check-frozen", action="store_true",
+                    help="only run the frozen-source check (graph, reconcile, gemini_path, evidence identical to stage-e-done; "
+                         "intake.py only added denylist lines) and exit 0 on PASS, 1 otherwise")
     a = ap.parse_args(argv)
+    if a.check_frozen:
+        return frozen_check.main()
+    if not a.sealed_dir:
+        ap.error("sealed_dir is required unless --check-frozen is given")
     try:
         for line in seal(a.sealed_dir):
             print(line)

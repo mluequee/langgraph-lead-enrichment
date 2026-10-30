@@ -197,3 +197,25 @@ cap and balance are resolved first.
 | Models and Gemini | unchanged; Gemini off |
 | Verification | blind, 8 minutes a lead, verdicts per section 6 |
 | Interval | Wilson 95% |
+
+## Amendments
+
+### 2026-10-30: clarification of section 1, "must be empty"
+
+Section 1 says the diff of the five frozen files against `stage-e-done` "must be empty" at tag time, and also says
+the only allowed later change to `src/intake.py` is Place ID denylist lines. Read literally, those two sentences
+disagree once a denylist line exists. This entry settles it:
+
+- `src/graph.py`, `src/reconcile.py`, `src/gemini_path.py` and `src/evidence.py`: the diff against
+  `stage-e-done` must be empty.
+- `src/intake.py`: every changed line must be an ADDED line inside the `PLACE_ID_DENYLIST` block, as a
+  `"<place id>": "<reason>",` entry. A removed line, a changed line, an added line outside the block, an entry
+  without a reason, or an entry repeating an existing Place ID fails.
+
+`eval/frozen_check.py` applies exactly this rule. The seal script runs it and records `frozen_source_check`
+(PASS or FAIL) and `denylist_lines_added` (a count) in `SEAL.txt`, and nothing else about it. The stage F gate
+runs the same check. The tag `stage-f-run` is placed after the skim and any denylist commit, and before the
+sample is drawn and before the cold run.
+
+This is a clarification made on 2026-10-30, before any Atlanta data existed in this repository and before any
+lead was pulled. It changes no definition in sections 2 to 12 and cannot change the number.

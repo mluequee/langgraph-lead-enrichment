@@ -245,7 +245,7 @@ def score(worksheet_path, sealed_dir, clean_csv, out_dir, today=None):
         L += ["", line2]
     else:
         L += ["", "No lead is flagged as a chain-name overlap with Charlotte; the with/without figures are the same."]
-    L += ["", "Seal facts: " + "; ".join(f"{k} {seal.get(k, '?')}" for k in ("git_commit", "frozen_src_diff_lines", "src_uncommitted_changes", "gemini_status")),
+    L += ["", "Seal facts: " + "; ".join(f"{k} {seal.get(k, '?')}" for k in ("git_commit", "frozen_source_check", "denylist_lines_added", "src_uncommitted_changes", "gemini_status")),
           "Frozen inputs (sha256, first 16): " + "; ".join(f"{k} {v[:16]}" for k, v in hashes.items()),
           f"Scored on {today}. D6: blind truth only; any later correction is a footnote, not a change to the line above."]
     text = "\n".join(L) + "\n"

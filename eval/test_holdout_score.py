@@ -117,13 +117,34 @@ check("SEAL.txt holds no name either", not any(n in seal_txt for n in NAMES + ["
 check("SEAL.txt records the export hash, the database hash, the git commit and the frozen-source diff",
       f"sha256 enriched_leads.csv: {hc.file_sha256(os.path.join(sealed, 'enriched_leads.csv'))}" in seal_txt
       and f"sha256 leads.db: {hc.file_sha256(dbp)}" in seal_txt and "git_commit: " in seal_txt
-      and sl.read_seal(sealed)["frozen_src_diff_lines"] in ("0", "unknown"))
+      and sl.read_seal(sealed)["frozen_source_check"] in ("PASS", "UNKNOWN") and sl.read_seal(sealed)["denylist_lines_added"].isdigit()
+      and "frozen_src_diff_lines" not in sl.read_seal(sealed))
 s = sl.read_seal(sealed)
 check("SEAL.txt counts: 14 leads = 9 found (the Ambiguous lead was named too) + 3 no_owner_found + 1 error + 1 skipped; 1 found without evidence",
       s["leads"] == "14" and s["outcome error"] == "1" and s["outcome skipped"] == "1" and s["outcome found"] == "9"
       and s["outcome no_owner_found"] == "3" and s["outcome needs_review"] == "0" and s["found_without_evidence_url"] == "1")
 check("SEAL.txt confirms the run was Brave-only (every result gemini_status off)", s["gemini_status"] == "off 13")
 check("a second seal on the same folder is refused", "already exists" in (raises(lambda: sl.seal(sealed)) or ""))
+
+# the frozen-source record in SEAL.txt: PASS/FAIL plus the count of added denylist entries, nothing else
+real_check = sl.frozen_check.git_frozen_check
+try:
+    for status, added, why in (("FAIL", 0, ["src/graph.py differs from stage-e-done (it must be identical)"]), ("PASS", 3, [])):
+        folder_x = os.path.join(BASE, f"sealed_{status}")
+        shutil.copytree(sealed, folder_x)
+        os.remove(os.path.join(folder_x, "SEAL.txt"))
+        sl.frozen_check.git_frozen_check = lambda st=status, ad=added, w=why: (st, ad, w)
+        printed_x = sl.seal(folder_x)
+        text_x = open(os.path.join(folder_x, "SEAL.txt"), encoding="utf-8").read()
+        sx = sl.read_seal(folder_x)
+        check(f"SEAL.txt records frozen_source_check: {status} and denylist_lines_added: {added}",
+              sx["frozen_source_check"] == status and sx["denylist_lines_added"] == str(added))
+        check(f"SEAL.txt ({status}) carries no reason text, file names or diff: only the two values",
+              "differs" not in text_x and "src/graph.py" not in text_x and "frozen_src_diff_lines" not in text_x)
+        warned = any("frozen source check" in line for line in printed_x)
+        check(f"a {status} frozen check {'prints a WARNING' if status != 'PASS' else 'prints no warning'}", warned == (status != "PASS"))
+finally:
+    sl.frozen_check.git_frozen_check = real_check
 os.makedirs(os.path.join(BASE, "empty_dir"), exist_ok=True)
 check("sealing a folder with no export is refused (empty folder)", "missing" in (raises(lambda: sl.seal(os.path.join(BASE, "empty_dir"))) or ""))
 
