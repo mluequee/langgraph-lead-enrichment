@@ -219,3 +219,31 @@ sample is drawn and before the cold run.
 
 This is a clarification made on 2026-10-30, before any Atlanta data existed in this repository and before any
 lead was pulled. It changes no definition in sections 2 to 12 and cannot change the number.
+
+### 2026-11-07: population is qualified_lead = true only (settles sections 1 and 3)
+
+Section 1 defines the population as "the output of the n8n workflow Ai Lead Qualification" but does not say
+whether rows that workflow did not mark as qualified are in it. The validator (`eval/holdout_intake.py`)
+keeps every row. This entry settles it:
+
+- The population is the rows whose `qualified_lead` value is `true` (trimmed, case-insensitive). A blank,
+  `false` or any other value is not qualified and never enters the intake folder.
+- The filter runs inside the validator, in its first run (no `--sample`), after the phantom-column
+  realignment and the Place ID dedupe and before the skim. The skim list and the sample (section 3, step 4)
+  are drawn from the qualified rows only. If two rows share a Place ID and disagree on `qualified_lead`,
+  the validator stops.
+- The validator prints the count of each distinct `qualified_lead` value and stops if it finds a value
+  other than true, false or blank, so an unexpected spelling cannot silently drop rows.
+- The raw pull is saved only after Get Websites has finished on every row and Ai Lead Qualification has
+  been re-run on every row after it, so that no row is filtered on incomplete data. Marvin records that
+  both steps are complete, as a dated line in the session log, before the raw pull is saved.
+- The result reports the number of rows in the raw pull, the number qualified and the number not
+  qualified (counts only), and names the workflow and the pull date. The population statement in
+  section 1 now reads "leads that Ai Lead Qualification marked qualified".
+- Unchanged: sample size 45 (all, if 45 or fewer qualify), seed, draw rule, every definition in sections
+  2 and 4 to 12, and the frozen source files. Only `eval/holdout_intake.py`, its test and this file change.
+
+Why: section 1 says the number describes "leads MBG would work", and rows the qualification step rejected
+are not leads MBG would work. The choice was made from that wording, not from any count of qualified rows
+or any pipeline answer. This entry was made after the Atlanta pull had started in n8n but before any
+Atlanta lead entered this repository, before the validator ran, and before any pipeline run on Atlanta data.
