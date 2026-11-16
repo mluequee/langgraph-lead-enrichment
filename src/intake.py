@@ -17,6 +17,13 @@ SKIPPED_FILE = "skipped_leads.csv"       # gitignored by *.csv; holds real busin
 # Add a line per record, with the business name and why.
 PLACE_ID_DENYLIST = {
     "ChIJn0eh8yihVogR7mNmS1xrqTU": "Barber Kons the Butcher: independent barber, not a shop",
+    "ChIJQ8HwirId9YgRe35o2JyXgIo": "GHOST (Private Barber Studio): independent barber, not a shop (Marvin, skim 2026-11-16)",
+    "ChIJcRZdkIb99IgR_7S8cmvhSkc": "The Fade Room Barber Suite With Jamal: mobile barber, not a shop (Marvin, skim 2026-11-16)",
+    "ChIJ00xVaYMD9YgRl1_VkfvSHF0": "Crazy razor Philly cutz /contact via chat: mobile barber, not a shop (Marvin, skim 2026-11-16)",
+    "ChIJL00QyDAF9YgRkSeshWjNHCg": "Ali Da Barber: independent personal-brand barber, not a shop (Marvin, skim 2026-11-16)",
+    "ChIJ92J4AGkD9YgRVG9U0_6EWN0": "Fresh Kutz by 'Eddie G': independent barber, not a shop (Marvin, skim 2026-11-16)",
+    "ChIJzb3jvaH59IgRxcS-Po-OP_Q": "Handsome Academy Studio: not a real shop, a converted garage (Marvin, skim 2026-11-16)",
+    "ChIJP1u9CJoD9YgRI0UpIdXYwfY": "Mauricio The Hair Doctor: independent barber who also sells hair products, not a shop (Marvin, skim 2026-11-16)",
 }
 
 AT_SIGN_REASON = "business name contains '@' (mobile or independent barber, or a person-as-business record)"
