@@ -1,29 +1,40 @@
 """Offline check of a pulled lead CSV before any spend (stage F, protocol section 3).
 
     # 1. whole pull, no sample: report + eyeball list for your skim
-    python eval/holdout_intake.py data/atlanta/intake/atlanta_pull_raw.csv --out data/atlanta/intake
+    python eval/holdout_intake.py data/atlanta/intake/atlanta_pull_raw.csv --out data/atlanta/intake \
+        --pull-date 2026-11-15
     # 2. after the skim and any denylist commit: draw the sample from the filtered population
     python eval/holdout_intake.py data/atlanta/intake/atlanta_pull_raw.csv --out data/atlanta/intake \
-        --sample 45 --seed 20261011 --skimmed
+        --pull-date 2026-11-15 --sample 45 --seed 20261011 --skimmed
 
 Free and offline: no network, no keys, never imports the pipeline graph. It reads the raw CSV (never modifies
 it) and, read-only, the Charlotte leads.db.
 
-What it does, in order:
+What it does, in order (the population rule is the 2026-11-07 amendment in eval/HOLDOUT_PROTOCOL.md):
   realigns a phantom leading column (headers shifted against the data), strips a byte-order mark;
-  STOPS if any Place ID is also in the Charlotte database (wrong city or wrong file);
-  drops rows with no name or no Place ID, duplicate Place IDs (first kept), unparsable addresses, other states;
+  needs a qualified_lead column (STOPS without it); counts its values over ALL rows, normalized (trimmed,
+  lowercase): true, false, blank; STOPS on any other value, naming the value and its rows but no business;
+  STOPS if any Place ID is also in the Charlotte database (wrong city or wrong file; sees all rows);
+  STOPS if rows sharing a Place ID disagree on qualified_lead (blank versus false counts as disagreeing);
+  drops rows with no name or no Place ID and duplicate Place IDs (first kept), counting them over all rows;
+  keeps only the rows whose qualified_lead is true (the population); every later step sees those rows only;
+  prints and writes a counts block: raw pull, workflow, pull date, removed, remaining, qualified, not qualified;
+  drops unparsable addresses and other states;
   applies the pipeline's own intake rule (the '@' rule and the Place ID denylist);
   flags chain-name overlaps with Charlotte (kept), same-name different-Place-ID leads, shared phone/address,
   and names that look like a person or a mobile/independent barber (the eyeball list);
   writes atlanta_leads_filtered.csv (the whole filtered pull). Only with --sample does it also write
   atlanta_leads_clean.csv (the list that is run) and sample.txt.
 
+A row that is not qualified (false or blank) is only counted: its business name and Place ID appear in no file
+under --out, in the report or on the console, whatever else would have happened to it.
+
 Outputs go in --out, which must be a folder under <repo>/data/ (gitignored). They hold real business names.
 Exit code 0 = ok, 2 = stopped (reason in the report).
 """
 import argparse
 import csv
+import datetime
 import io
 import os
 import re
@@ -49,8 +60,12 @@ ALIASES = {
     "id": ("id", "place_id", "place id", "google place id", "googleplaceid"),
     "website": ("website", "website_url", "site"),
     "google_url": ("google_url", "google url", "maps_url", "google maps url"),
+    "qualified_lead": ("qualified_lead", "qualified lead"),
 }
-REQUIRED = ("business_name", "address", "id")
+REQUIRED = ("business_name", "address", "id", "qualified_lead")
+QUALIFIED_VALUES = ("true", "false", "")
+DEFAULT_WORKFLOW = "Ai Lead Qualification"
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 N8N_RE = re.compile(r"decision|first_name|last_name|owner|email|outreach|pitch|confidence|hunter|dm_flag|persons?\b", re.I)
 
 PLACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
@@ -193,8 +208,11 @@ def intake_py_committed():
 
 
 # --------------------------------------------------------------------------------------------------
-def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, charlotte_db=None, state="GA", echo=print):
-    """Validate, filter, flag, and (with sample) draw. Returns the exit code (0 ok, 2 stopped)."""
+def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, charlotte_db=None, state="GA", echo=print,
+        workflow=DEFAULT_WORKFLOW, pull_date=None):
+    """Validate, filter, flag, and (with sample) draw. Returns the exit code (0 ok, 2 stopped).
+
+    workflow and pull_date are only named in the report block (pull_date: a date or a YYYY-MM-DD string)."""
     R = []                                           # report lines
 
     def say(line=""):
@@ -283,7 +301,22 @@ def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, ch
 
     records = [{"row": i + 2, "business_name": cell(r, "business_name"), "website": cell(r, "website"),
                 "address": cell(r, "address"), "phone": cell(r, "phone"), "id": cell(r, "id"),
-                "google_url": cell(r, "google_url")} for i, r in enumerate(data)]
+                "google_url": cell(r, "google_url"), "q": cell(r, "qualified_lead").strip().lower()} for i, r in enumerate(data)]
+
+    # qualified_lead, counted over ALL rows before any dedupe or drop (counts only: no names, no Place IDs)
+    qcount = Counter(rec["q"] for rec in records)
+    say(f"qualified_lead values, all {len(records)} rows: true {qcount['true']}, false {qcount['false']}, blank {qcount['']}")
+    unexpected = {}
+    for rec in records:
+        if rec["q"] not in QUALIFIED_VALUES:
+            unexpected.setdefault(rec["q"], []).append(rec["row"])
+    if unexpected:
+        say("STOP: qualified_lead holds a value other than true, false or blank. Fix the pull (or tell me what the value means) "
+            "before anything is filtered; nothing was written except this report.")
+        for val, rows_at in sorted(unexpected.items(), key=lambda kv: kv[1][0]):
+            more = "" if len(rows_at) <= 10 else f" (first 10 of {len(rows_at)})"
+            say(f"  {val[:40]!r}: {len(rows_at)} row(s), rows {', '.join(str(n) for n in rows_at[:10])}{more}")
+        return finish(2)
 
     n8n_cols = [h for h in header if h.strip() and N8N_RE.search(h) and norm.index(h.strip().lower()) not in
                 {header_index[c] for c in header_index}]
@@ -303,30 +336,60 @@ def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, ch
     if os.path.exists(charlotte_db):
         charlotte = place_ids_readonly(charlotte_db)
         overlap = sorted({r["id"] for r in records if r["id"] in charlotte})
+        overlap_shown = sorted({r["id"] for r in records if r["id"] in charlotte and r["q"] == "true"})   # never print a not-qualified row's ID
         say(f"Charlotte database read-only: {len(charlotte)} leads; Place ID overlap with this pull: {len(overlap)}")
         if overlap:
-            say(f"STOP: {len(overlap)} Place ID(s) in this pull are already Charlotte leads (e.g. {', '.join(overlap[:3])}). "
+            e_g = f" (e.g. {', '.join(overlap_shown[:3])})" if overlap_shown else ""
+            say(f"STOP: {len(overlap)} Place ID(s) in this pull are already Charlotte leads{e_g}. "
                 "Wrong city or wrong file. Nothing was written except this report.")
             return finish(2)
     else:
         say(f"WARNING: {charlotte_db} not found; Place ID and chain-name overlap with Charlotte NOT checked.")
 
-    # ---- filters ---------------------------------------------------------------------------------
-    dropped = []                                       # (row, business_name, place_id, reason)
-    kept, seen = [], {}
+    # ---- duplicate Place IDs must agree on qualified_lead ------------------------------------------------------
+    by_pid = defaultdict(list)
     for rec in records:
+        if rec["id"]:
+            by_pid[rec["id"]].append(rec)
+    disagree = [(pid_, recs) for pid_, recs in by_pid.items() if len({r["q"] for r in recs}) > 1]
+    if disagree:
+        disagree.sort(key=lambda t: t[1][0]["row"])
+        say(f"STOP: {len(disagree)} Place ID(s) appear on more than one row with different qualified_lead values "
+            "(blank versus false counts as different). Fix the pull; nothing was written except this report.")
+        for pid_, recs in disagree[:3]:
+            shown = pid_ if any(r["q"] == "true" for r in recs) else "(Place ID withheld: no row of it is qualified)"
+            say(f"  {shown}: rows {', '.join(str(r['row']) for r in recs[:10])}")
+        return finish(2)
+
+    # ---- filters ---------------------------------------------------------------------------------------------
+    # Counts run over ALL rows; a row is written to dropped_rows.csv only if it is qualified (the privacy rule).
+    dropped = []                                       # (row, business_name, place_id, reason): qualified rows only
+    kept, seen = [], {}
+    n_missing = n_dup = 0
+    for rec in records:
+        qualified_row = rec["q"] == "true"
         if not rec["business_name"] or not rec["id"]:
-            dropped.append((rec["row"], rec["business_name"], rec["id"], "missing business name or Place ID"))
+            n_missing += 1
+            if qualified_row:
+                dropped.append((rec["row"], rec["business_name"], rec["id"], "missing business name or Place ID"))
         elif rec["id"] in seen:
-            dropped.append((rec["row"], rec["business_name"], rec["id"], f"duplicate Place ID (first seen at row {seen[rec['id']]})"))
+            n_dup += 1
+            if qualified_row:
+                dropped.append((rec["row"], rec["business_name"], rec["id"], f"duplicate Place ID (first seen at row {seen[rec['id']]})"))
         else:
             seen[rec["id"]] = rec["row"]
             kept.append(rec)
-    n_dup = sum(1 for d in dropped if d[3].startswith("duplicate"))
-    n_missing = len(dropped) - n_dup
+
+    # the qualified filter: only qualified_lead = true goes on, before the address/state check, the skim and the draw
+    qualified = [rec for rec in kept if rec["q"] == "true"]
+    say("")
+    say(f"raw pull: {len(records)} rows   workflow: {workflow}   pull date: {pull_date if pull_date else 'not given'}")
+    say(f"removed as missing name/ID: {n_missing}   removed as duplicate Place ID: {n_dup}   remaining: {len(kept)}")
+    say(f"qualified (true): {len(qualified)}   not qualified (false or blank): {len(kept) - len(qualified)}")
+    say("")
 
     stage = []
-    for rec in kept:
+    for rec in qualified:
         city, st = sdb.parse_city_state(rec["address"])
         rec["city"], rec["state"] = city, st
         if not city:
@@ -343,7 +406,7 @@ def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, ch
         reason = intake.skip_reason(rec["business_name"], rec["id"])
         (skipped if reason else population).append((rec, reason) if reason else rec)
 
-    say(f"rows read {len(records)} -> missing name/ID {n_missing}, duplicate Place ID {n_dup}, unparsable address {n_addr}, "
+    say(f"rows read {len(records)}, qualified (true) {len(qualified)} -> unparsable address {n_addr}, "
         f"not {state} {n_state}, intake skip {len(skipped)} -> filtered population {len(population)}")
     say(f"Place ID denylist: {len(intake.PLACE_ID_DENYLIST)} entr{'y' if len(intake.PLACE_ID_DENYLIST) == 1 else 'ies'}, all Charlotte "
         "Place IDs, so none can match here. Atlanta entries come from your skim: add each to PLACE_ID_DENYLIST in "
@@ -445,6 +508,16 @@ def run(raw_path, out_dir, sample=None, seed=hc.PROTOCOL_SEED, skimmed=False, ch
     return finish(0)
 
 
+def iso_date(text):
+    """argparse type: YYYY-MM-DD only (date.fromisoformat alone also takes 20261115 and 2026-W46-1 on newer Pythons)."""
+    if not ISO_DATE_RE.match(text or ""):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date in YYYY-MM-DD form")
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a real date ({e})")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("raw_csv", help="the pulled lead CSV (read, never modified)")
@@ -454,11 +527,13 @@ def main(argv=None):
     ap.add_argument("--skimmed", action="store_true", help="I have read eyeball_list.txt and committed any denylist lines")
     ap.add_argument("--state", default="GA", help="two-letter state every lead must be in (default GA)")
     ap.add_argument("--charlotte-db", default=None, help="Charlotte database to check overlap against (default <repo>/leads.db)")
+    ap.add_argument("--workflow", default=DEFAULT_WORKFLOW, help=f"n8n workflow that produced the pull, named in the report (default {DEFAULT_WORKFLOW})")
+    ap.add_argument("--pull-date", required=True, type=iso_date, help="date the raw pull was saved, YYYY-MM-DD, named in the report")
     a = ap.parse_args(argv)
     if not os.path.exists(a.raw_csv):
         print(f"STOP: {a.raw_csv} not found")
         return 2
-    return run(a.raw_csv, a.out, a.sample, a.seed, a.skimmed, a.charlotte_db, a.state)
+    return run(a.raw_csv, a.out, a.sample, a.seed, a.skimmed, a.charlotte_db, a.state, workflow=a.workflow, pull_date=a.pull_date.isoformat())
 
 
 if __name__ == "__main__":
