@@ -247,3 +247,36 @@ Why: section 1 says the number describes "leads MBG would work", and rows the qu
 are not leads MBG would work. The choice was made from that wording, not from any count of qualified rows
 or any pipeline answer. This entry was made after the Atlanta pull had started in n8n but before any
 Atlanta lead entered this repository, before the validator ran, and before any pipeline run on Atlanta data.
+
+### 2026-11-15: Brave pre-run check (section 4); section 1 population wording; validator behaviours on record
+
+Three clarifications. None changes a definition in sections 2 to 12, and none can change the number.
+
+1. Section 4, "Before the run". The sentence "Brave balance of $6 or more" assumed a prepaid balance. The
+   Brave account is a postpaid plan with a $5 monthly credit and any overage billed at month end, so there
+   is no balance to run out of before the run. The pre-run check is now: the Brave dashboard shows the
+   plan as active with a payment method on file, and the dashboard's usage limits page shows no limit
+   below the expected usage of this run. Marvin notes the requests and cost this month shown on the
+   dashboard home page in the session log on the day of the run. The Anthropic credit of $5 or more and the
+   same-day Charlotte key check (`--limit 3`) are unchanged. The reason is section 8: an unusable key looks
+   like every call failing, so it is checked before the run, not after.
+
+2. Section 1, population sentence. The body of section 1 still reads "the output of the n8n workflow Ai
+   Lead Qualification". The 2026-11-07 entry settled the population as the rows that workflow marked
+   qualified (`qualified_lead` = true, trimmed, case-insensitive). Where the body of section 1 and the
+   2026-11-07 entry differ, the 2026-11-07 entry governs. The body is left as written, as section 10
+   requires.
+
+3. Validator behaviours, put on record. `eval/holdout_intake.py` (merged to main as commit cf26933) does the
+   following, beyond the 2026-11-07 text:
+   - A pull with no `qualified_lead` column stops the run (exit 2).
+   - Duplicate Place IDs whose `qualified_lead` values differ stop the run. Blank versus false counts as
+     differing.
+   - `--pull-date` (YYYY-MM-DD, the local date of the Drive export) is required. `--workflow` defaults to
+     "Ai Lead Qualification".
+   - A not-qualified row is counted only. Its name and Place ID appear in no output file, in the report or
+     on the console. The stop messages print a Place ID only when at least one row with that ID is
+     qualified.
+
+This entry is made after the validator was merged and before the raw Atlanta pull was saved to this
+repository, before the validator ran on Atlanta data, and before any pipeline run on Atlanta data.
