@@ -1,115 +1,113 @@
 # LangGraph Lead Enrichment Pipeline
 
-Production-grade LangGraph implementation of a lead enrichment workflow. Processes business data through multi-stage extraction and verification, with full error isolation, cost tracking, and accuracy measurement.
+Finds the owner's name for a local storefront business from public web sources. Every name it delivers comes with a source link. When the evidence is weak or two sources disagree, it leaves the field blank or flags the row for review instead of guessing.
 
-**Portfolio artifact demonstrating:** Fan-out/fan-in parallelism, LLM confidence cascades, waterfall enrichment, cost analysis, and production instrumentation.
+This is a portfolio project. The point is the engineering and the honest measurement, not a data product.
 
 ---
 
-## Architecture
+## Measured accuracy (sealed holdout, Atlanta, November 2026)
+
+The code was frozen, then run once on 45 Atlanta-area barbershops it had never seen. The owners were researched by hand before the run, and the answers stayed sealed until scoring.
+
+| Configuration | Names delivered | Correct, lenient | Correct, strict | Wrong | Correct blanks |
+|---|---|---|---|---|---|
+| Brave search only | 21 of 43 | 8/21 = 38.1% (21% to 59%) | 6/21 = 28.6% (14% to 50%) | 13 | 4 of 5 |
+| Brave + Gemini, reconciled | 23 of 43 | 17/23 = 73.9% (54% to 87%) | 16/23 = 69.6% (49% to 84%) | 6 | 4 of 5 |
+
+Ranges are 95% intervals. Lenient counts a partial name (first name only, or a name the owner goes by) as correct. Strict needs the full name. Two of the 45 leads could not be determined by hand and are excluded from every denominator.
+
+What these numbers do and do not say:
+- The sample is small (23 delivered names), from one metro and one industry. Read it as a range, not a single figure.
+- Every delivered name in the combined run had an evidence URL (23 of 23).
+- Cost of the combined run: about $2.00 for 45 leads, about $0.045 a lead, read from billing.
+
+Full scorer output: [`eval/HOLDOUT_RESULT.md`](eval/HOLDOUT_RESULT.md) and [`eval/HOLDOUT_RESULT_C2.md`](eval/HOLDOUT_RESULT_C2.md). Protocol: [`eval/HOLDOUT_PROTOCOL.md`](eval/HOLDOUT_PROTOCOL.md).
+
+### Correction to earlier versions of this README
+
+Earlier versions reported a hit rate against the old n8n workflow and counted about 40 leads as "LangGraph-only wins." That measured how often a name was filled in, not whether it was right. A blinded, hand-verified audit in September 2026 found that when the pipeline wrote a name it was right 17 of 41 times (41%), against 18 of 27 (67%) for the n8n workflow. The rebuild that followed (evidence-or-blank rules, location anchoring, a second Gemini path and reconciliation) is what the Atlanta holdout above measures.
+
+---
+
+## How it works
 
 ```
-prep_lead (initialize state)
-  ↓
-build_queries (4 deterministic query angles)
-  ↓
-[search_q1 ∥ search_q2 ∥ search_q3 ∥ search_q4] (parallel, reducer merges)
-  ↓
-combine_and_score (score, dedupe by URL, top 8, cap 40k chars)
-  ↓
-extract_owner (Haiku: structured extraction with confidence)
-  ↓
-route_after_search
-  ├─ high → END
-  ├─ medium → verify_owner
-  └─ low → verify_owner + About-page fallback
-  ↓
-[verify_owner (Sonnet: B→A cascade logic)]
-  ↓
-route_after_verification
-  ├─ high/medium → END
-  └─ low → fetch_about_page + extract_owner (2nd pass)
-  ↓
-[fetch_about_page (surgical extraction: founder/owner/CEO + name only)]
-  ↓
-route_after_about
-  ├─ high/medium → END
-  └─ low → flag_for_review → END
+prep_lead
+  |-- Brave branch
+  |     build_queries          5 query angles, deterministic
+  |     search_q1 .. search_q5 parallel Brave searches (fan-out, reducer merges)
+  |     combine_and_score      location anchor, dedupe, ranking (no LLM)
+  |     extract_owner          Claude Haiku, structured output, evidence check
+  |       uncertain   -> verify_owner (Claude Sonnet)
+  |       still low   -> fetch_about_page -> extract_owner_from_about
+  |       still low   -> flag_for_review
+  |
+  |-- Gemini branch (optional, --gemini)
+  |     gemini_search          Gemini with Google Search grounding, one call per lead
+  |
+reconcile                      waits for both branches, pure Python
+finalize
 ```
+
+**Reconcile rules** ([`src/reconcile.py`](src/reconcile.py)):
+- Both paths name the same person: deliver the fuller name.
+- Only one path names someone: deliver it only with a surname (and, for Gemini, only with an evidence URL).
+- The paths name different people: deliver nobody, mark the row for review and keep both candidates with their sources.
+- Gemini fails or is off: the Brave answer goes through unchanged. A Gemini failure never costs an answer.
 
 **Key design decisions:**
-- **Parallel fan-out (Phase 2):** 4 concurrent Brave searches via Annotated list reducer. Replaces n8n's 32s sequential chain with ~1-2s parallel execution.
-- **Scoring/dedupe (Phase 3):** Deterministic Python (no LLM). Instagram +60, TikTok +55, Facebook +40, LinkedIn +45, "owner" +50, "founder" +60, authwall-filtered. Top 8, 40k char cap.
-- **Sonnet verification (Phase 4, implemented as cascade not retry-loop):** When Haiku returns medium/low confidence, Sonnet re-reads combined text and either finds an alternative decision-maker (B) or downgrades to low (A). Enterprise pattern: cheap model first, verify only on uncertainty.
-- **Waterfall About-page (Phase 5):** Escalates only on verified-low. Fetches domain from top-ranked result; tries /about, /about-us, /team, /about-page; surgical text extraction (founder/owner/CEO keyword + capitalized name only, not full HTML).
-- **Error isolation (Phase 7):** Try/except on every external API call (Brave timeout/HTTP/generic, both Haiku nodes, Sonnet verify, About-fetch). No crashes — gracefully downgrades to low confidence and flags for review.
+- **Parallel fan-out.** Five concurrent searches through a list reducer replaced the old n8n chain of sequential searches and fixed waits.
+- **Deterministic scoring.** Ranking, dedupe and the location gate are plain Python, so they are cheap, repeatable and testable without API calls.
+- **Evidence or blank.** A name is delivered only if the cited source supports it, a name that only repeats the business name is rejected, and confidence is capped when the evidence is thin.
+- **Cheap model first.** Haiku extracts; Sonnet runs only when Haiku is unsure; the About-page fetch runs only when both are.
+- **Error isolation.** Every external call is wrapped. A failed call downgrades the row instead of crashing the batch.
+- **Cost tracking.** Every run records per-lead cost.
 
 ---
 
-## Phase-by-Phase Build
+## Known limits
 
-| Phase | Component | What | Status |
-|-------|-----------|------|--------|
-| 1 | Structured output | Pydantic `OwnerResult` with confidence (high/medium/low) + all n8n fields | ✅ |
-| 2 | Parallel fan-out | Reducer-based 4-concurrent Brave searches | ✅ |
-| 3 | Scoring/dedupe | Deterministic Python ranking + top-8 selection | ✅ |
-| 4 | Confidence routing | Sonnet verification cascade (B→A logic) | ✅ |
-| 5 | Waterfall enrichment | About-page fetch + surgical extraction on low confidence | ✅ |
-| 6 | Real data in/out | SQLite + LeadDatabase abstraction + batch loop | ✅ |
-| 7 | Production polish | Error isolation, cost tracking, accuracy comparison | ✅ |
+- **Same-name shop in another city.** The location gate discards results that name another state or a full city-and-state address. A source that names only a bare city passes. This caused two of the real errors in the holdout. The fix would change behavior and is not built.
+- **Employee taken as owner.** One holdout error was a barber who works at the shop, not the owner.
+- **Website reading was measured, not built.** On the Charlotte development set, reading shop websites would add at most 0 to 2 correct names out of 47 ([`eval/diag_ceiling.py`](eval/diag_ceiling.py), [`eval/diag_fetch_status.py`](eval/diag_fetch_status.py)).
+- **Brave-only is weak.** Without the Gemini path, under 4 in 10 delivered names were right.
 
 ---
 
-## Phase 7: Production Metrics
+## Build history
 
-**Validation:** 3 full runs × 107 Charlotte barbershop leads = **321 lead-runs, 0 crashes, 100% availability**
+| Stage | What |
+|---|---|
+| Phases 1-7 | Port of the n8n "Get Persons" workflow: structured output with confidence, parallel fan-out, deterministic scoring, Sonnet verification, About-page fallback, SQLite batch runs, error isolation and cost tracking |
+| September 2026 audit | Blinded hand-verified audit found 41% precision; the README's earlier accuracy claim was withdrawn |
+| Phase 8 | Identity anchor: location-anchored search, deterministic location gate, regression harness |
+| Phase 9 | Evidence or blank: citation gate, anti-echo, calibration floor |
+| Accuracy rebuild | Evidence and source records, Gemini grounding as a second path, pure-Python reconcile |
+| Holdout | Frozen code, blind hand-researched worksheet, sealed answers, scorers written and committed before the runs |
 
-### Cost Tracking
-```
-Haiku tokens:     307,530 input + 37,988 output
-Sonnet tokens:     69,996 input + 10,599 output
-Total tokens:      426,113
-Brave API calls:   428 (4 per lead, deterministic)
-Estimated cost:    $2.91/batch = $0.027/lead
-                   (Anthropic ≈ $1.10; Brave ~$0.005/call or $0 on free tier)
-```
+**Reliability check (Phase 7):** 3 full runs of 107 Charlotte leads, 321 lead-runs, 0 crashes, including a batch where every API call failed because the account was out of credits.
 
-### Accuracy vs n8n Baseline
-```
-Exact matches:           22/107 (20.6%)
-Partial matches:          8/107 ( 7.5%)
-Combined hit rate:       28.0%*  (run 2: 29.9% — 28-30% band is LLM variance)
-
-LG-only wins:           ~40/107 (found owners where n8n stored NA)
-True divergence:         ~8/107 (both found different people → manual review)
-LG real misses:         ~10/107 (n8n found someone LG missed)
-Both unknown:            1-3/107 (no public data)
-
-*Honest caveat: n8n's CSV baseline contains literal "NA NA" placeholders and partial names.
-Real ground truth requires manual spot-check on the ~8 divergence cases.
-```
-
-### Bugs Found & Fixed (Production Lessons)
-1. **LangGraph parallel-write conflict** — all 4 search nodes returned `"cost"`; only serial nodes can return it. Fix: parallel nodes mutate cost locally but don't return.
-2. **Windows cp1252 encoding** — Unicode arrows threw UnicodeEncodeError on FileHandler. Fix: `FileHandler(..., encoding='utf-8')`.
-3. **Token capture silent failure** — `hasattr(response, 'usage')` always False. LangChain exposes `usage_metadata` only with `include_raw=True`. Fix: restructured output handling.
-4. **Sonnet content as list** — newer model returns `response.content` as list of blocks, not string. `.find('{')` blew up. Fix: join blocks on type check.
-5. **Confidence compared as strings** — `"high" < "medium"` is alphabetically TRUE. My own REVIEW flag caught it (CMAC CUTZ). Fix: rank-map compare.
-6. **Placeholder normalization** — `<UNKNOWN>` and `"NA"` both truthy, scored as MISS when both empty. Fix: `_norm()` function.
-7. **Dict-call typo** — `n8n_baseline('first', '')` instead of `.get()`.
-8. **About-page token bloat** — sentence filter splits raw HTML on periods; HTML has few periods so "3 sentences" = 25K-token blobs. Capped chars; dropped to ~9-12K tokens.
-9. **The non-code bug** — out of API credits. Every call failed, error isolation caught all of it (0 crashes, batch completed with <ERROR> results). Diagnosed by stepping outside the code.
-
-**Interview angle:** "Each bug is a lesson in production systems. The most valuable one? The non-code bug — out of credits. The system failed gracefully and told me exactly why, because error isolation was built in."
+### Bugs found and fixed
+1. **LangGraph parallel-write conflict.** All parallel search nodes returned `"cost"`; only serial nodes can. Fix: parallel nodes update cost locally and do not return it.
+2. **Windows cp1252 encoding.** Unicode arrows threw UnicodeEncodeError in the log file handler. Fix: `FileHandler(..., encoding='utf-8')`.
+3. **Token capture silent failure.** `hasattr(response, 'usage')` was always False. LangChain exposes `usage_metadata` only with `include_raw=True`.
+4. **Sonnet content as a list.** Newer models return `response.content` as a list of blocks, not a string. Fix: join text blocks.
+5. **Confidence compared as strings.** `"high" < "medium"` is alphabetically true. Fix: rank-map compare.
+6. **Placeholder normalization.** `<UNKNOWN>` and `"NA"` are both truthy and were scored as misses. Fix: one shared no-name set.
+7. **Dict-call typo.** `n8n_baseline('first', '')` instead of `.get()`.
+8. **About-page token bloat.** A sentence filter split raw HTML on periods, producing 25K-token blobs. Fix: character caps.
+9. **The non-code bug.** Out of API credits. Error isolation caught every failure and the batch finished with flagged rows.
 
 ---
 
-## Setup & Run
+## Setup and run
 
 ### Requirements
 - Python 3.10+
-- Anthropic API key (Claude Haiku + Sonnet)
+- Anthropic API key (Claude Haiku and Sonnet)
 - Brave Search API key
+- Gemini API key, only if you run with `--gemini`
 
 ### Install
 ```bash
@@ -122,40 +120,25 @@ cp .env.example .env
 # Fill in your API keys in .env
 ```
 
-### Run a Batch
+### Run a batch
 ```bash
 python src/setup_database.py  # Initialize leads.db
 python src/run.py             # Process all leads (Gemini is off; --gemini opts in and costs money)
 # Output: langgraph_debug.log (DEBUG), console (INFO), enriched_leads.csv, skipped_leads.csv
-python eval/compare_n8n.py    # Optional: compare leads.db with the n8n baseline CSV (free, writes phase7_accuracy_comparison_TIMESTAMP.csv)
 ```
 
 ---
 
-## Key Learnings
+## What I learned
 
-- **Structured output with confidence is non-negotiable.** Raw text parsing is fragile; Pydantic schemas guarantee field presence and type.
-- **Error isolation beats perfection.** The system's value is that 321 lead-runs completed with 0 crashes, including a full batch where every API call failed (out of credits). Graceful degradation > precision.
-- **Parallel fan-out has a cost:** 4 concurrent Brave calls × 3 runs × 107 leads = 1,284 requests. Wouldn't be possible with sequential. n8n serialization was the bottleneck, not the LLMs.
-- **Waterfall enrichment works.** Medium/low confidence → About-page fetch (expensive) only when needed. You scale expensive steps, not baseline them.
-- **Cost transparency is a feature.** Knowing per-lead cost matters for business decisions. This is why every pipeline I build now includes a `LeadCost` class from day 1.
-
----
-
-## Future Directions (Not Built — Intentional)
-
-The original plan included a **CRAG-style retry loop** (Phase 4): low confidence → refine queries → new searches → re-extract. Implemented instead: **Sonnet verification cascade** (B→A logic). This is the enterprise standard — it's cheaper and more targeted than blind retry. Document the deviation as a design choice, not a shortcut.
-
-Other workflows in the n8n suite (Get Email, Lead Research, Outreach) can apply the same cost-tracking + error-isolation patterns. Next phase: propagate to all 7 for total pipeline economics.
+- **Fill rate is not accuracy.** The first version looked strong because it filled in names. A blinded check against hand-verified owners showed most of them were wrong. Nothing counts until it is tested against verified data.
+- **Freeze before you measure.** Tuning on the same leads you score inflates the number. The holdout was run once, on frozen code, with the scorer committed first.
+- **Two independent paths beat one.** Agreement between Brave and Gemini is a stronger signal than either model's own confidence label.
+- **Blank is a valid answer.** Holding back a weak name is worth more to an outreach list than a confident wrong one.
+- **Error isolation and cost tracking from day one.** Both paid for themselves the first time an API ran out of credits.
 
 ---
 
 ## License
 
 MIT
-
----
-
-## Contact
-
-Built as a portfolio project demonstrating LangGraph production patterns.
