@@ -3,8 +3,15 @@
 .env.local
 .env.*.local
 
-# Internal working notes - gitignored until the precision fix lands and the README is corrected (see Session-Log 2026-09-24)
+# Internal working notes for Claude Code - kept private (machine paths, cost notes, real shop names)
 CLAUDE.md
+
+# Reference clones of other public repos (read for the borrow list, not part of this project)
+DecisionMakerFinder/
+b2b-company-decision-maker-finder/
+business-contact-research-verification/
+galaxy-leads/
+lead-finder/
 
 # Database files
 leads.db
